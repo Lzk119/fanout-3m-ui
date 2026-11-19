@@ -30,6 +30,7 @@ type threeMMock struct {
 	requests       []string
 	publicHostLog  []string
 	loginCount     int
+	applyCount     int
 	expireFirst    bool
 	expired        bool
 	failRestore    bool
@@ -358,6 +359,13 @@ func (m *threeMMock) serveConfig(w http.ResponseWriter, r *http.Request, path st
 		default:
 			mockError(w, http.StatusMethodNotAllowed, "method")
 		}
+	case "/config/apply":
+		if r.Method != http.MethodPost {
+			mockError(w, http.StatusMethodNotAllowed, "method")
+			return
+		}
+		m.applyCount++
+		mockJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	default:
 		mockError(w, http.StatusNotFound, "unknown config")
 	}
@@ -420,6 +428,9 @@ func TestThreeMUICloneMergesBindingsAndWritesRoute(t *testing.T) {
 	if proxy["server"] != "127.0.0.1" || proxy["username"] != "u" || proxy["password"] != "p" {
 		t.Fatalf("SOCKS5 出站不对：%v", proxy)
 	}
+	if m.applyCount != 1 {
+		t.Fatalf("批量克隆后应只 apply 一次：%d", m.applyCount)
+	}
 }
 
 func TestThreeMUIUpdateInboundMigratesPortRule(t *testing.T) {
@@ -436,6 +447,9 @@ func TestThreeMUIUpdateInboundMigratesPortRule(t *testing.T) {
 	want := []string{"IN-PORT,12000,fanout-jp-home", "MATCH,DIRECT"}
 	if !reflect.DeepEqual(m.routing.Rules, want) {
 		t.Fatalf("旧端口路由未迁移：%v", m.routing.Rules)
+	}
+	if m.applyCount != 1 {
+		t.Fatalf("改端口迁移规则后应 apply 一次：%d", m.applyCount)
 	}
 }
 
@@ -535,6 +549,19 @@ func TestThreeMUIDeleteRemovesRulesBeforeOutbounds(t *testing.T) {
 	if patchAt < 0 || deleteAt < 0 || patchAt > deleteAt {
 		t.Fatalf("必须先删规则再删出站：%v", m.requests)
 	}
+	if m.applyCount != 1 {
+		t.Fatalf("删除后应 apply 一次：%d", m.applyCount)
+	}
+	applyAt := -1
+	for i, request := range m.requests {
+		if request == "POST /api/v1/config/apply" {
+			applyAt = i
+			break
+		}
+	}
+	if applyAt < 0 || applyAt < deleteAt {
+		t.Fatalf("apply 必须在删出站之后：%v", m.requests)
+	}
 }
 
 func TestManagerReconcileOutboundsUses3MUIBackend(t *testing.T) {
@@ -582,5 +609,41 @@ func TestRoutingReferences(t *testing.T) {
 	}
 	if routingReferences(base(), "fanout-old") {
 		t.Fatal("无引用时不应阻止清理")
+	}
+}
+
+func TestThreeMUIBindAppliesAfterRoute(t *testing.T) {
+	m := newThreeMMock(t)
+	m.listeners[1] = threeMListener{ID: 1, Name: "入口", Protocol: "vless", Port: "10001", Enabled: true}
+	m.routing.Rules = []string{"MATCH,DIRECT"}
+	tunnel := &Tunnel{Node: Node{HostName: "us-home"}, Port: 23001, Status: "up", Cred: SocksCred{User: "u", Pass: "p"}}
+
+	if err := m.panel().Bind(listenerTag(1), "us-home", []*Tunnel{tunnel}); err != nil {
+		t.Fatal(err)
+	}
+	if m.applyCount != 1 {
+		t.Fatalf("Bind 后应 apply 一次：%d", m.applyCount)
+	}
+	// 顺序：先同步出站、再写规则，最后才重载内核，避免部分生效。
+	outboundAt, patchAt, applyAt := -1, -1, -1
+	for i, request := range m.requests {
+		switch {
+		case strings.HasPrefix(request, "POST /api/v1/config/server-outbounds"):
+			outboundAt = i
+		case strings.HasPrefix(request, "PATCH /api/v1/config/server-routing"):
+			patchAt = i
+		case request == "POST /api/v1/config/apply":
+			applyAt = i
+		}
+	}
+	if outboundAt < 0 || patchAt < 0 || applyAt < 0 {
+		t.Fatalf("缺少关键请求：%v", m.requests)
+	}
+	if !(outboundAt < patchAt && patchAt < applyAt) {
+		t.Fatalf("请求顺序应为 出站→规则→apply：%v", m.requests)
+	}
+	want := []string{"IN-PORT,10001,fanout-us-home", "MATCH,DIRECT"}
+	if !reflect.DeepEqual(m.routing.Rules, want) {
+		t.Fatalf("绑定规则不对：%v", m.routing.Rules)
 	}
 }

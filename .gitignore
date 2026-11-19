@@ -1,3 +1,8 @@
 fanout
 *.tar.gz
 *.log
+
+# 研究用参考克隆与本地 Trae 数据，不进入发布仓库
+.research/
+.trae/
+fanout-3m-ui/

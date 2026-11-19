@@ -542,6 +542,16 @@ func (x *ThreeMUI) patchRules(rules []string) error {
 	return x.do(http.MethodPatch, "/config/server-routing", map[string]any{"rules": rules}, nil)
 }
 
+// apply 让 3m-ui 从数据库重新生成 config.yaml 并重载 Mihomo 内核。
+// server-outbounds 与 server-routing 的写入只落库，必须显式 apply 才会生效；
+// 空体会让 3m-ui 自行从 DB 生成最新配置，失败时它会回滚上一份。
+func (x *ThreeMUI) apply() error {
+	if err := x.do(http.MethodPost, "/config/apply", nil, nil); err != nil {
+		return fmt.Errorf("应用 3m-ui 配置失败: %w", err)
+	}
+	return nil
+}
+
 func boundListeners(list []threeMListener, cfg threeMRouting) map[string]string {
 	ports := map[int]string{}
 	for _, l := range list {
@@ -648,7 +658,10 @@ func (x *ThreeMUI) bind(inboundTag, hostname string, tunnels []*Tunnel) error {
 func (x *ThreeMUI) Bind(inboundTag, hostname string, tunnels []*Tunnel) error {
 	x.opMu.Lock()
 	defer x.opMu.Unlock()
-	return x.bind(inboundTag, hostname, tunnels)
+	if err := x.bind(inboundTag, hostname, tunnels); err != nil {
+		return err
+	}
+	return x.apply()
 }
 
 func (x *ThreeMUI) Rebind(oldHost string, target *Tunnel, tunnels []*Tunnel) error {
@@ -679,19 +692,25 @@ func (x *ThreeMUI) Rebind(oldHost string, target *Tunnel, tunnels []*Tunnel) err
 			}
 		}
 	}
-	return nil
+	return x.apply()
 }
 
 func (x *ThreeMUI) ResyncOutbound(t *Tunnel, tunnels []*Tunnel) error {
 	x.opMu.Lock()
 	defer x.opMu.Unlock()
-	return x.syncOutbounds(tunnels, false)
+	if err := x.syncOutbounds(tunnels, false); err != nil {
+		return err
+	}
+	return x.apply()
 }
 
 func (x *ThreeMUI) OnTunnelsChanged(tunnels []*Tunnel) error {
 	x.opMu.Lock()
 	defer x.opMu.Unlock()
-	return x.syncOutbounds(tunnels, true)
+	if err := x.syncOutbounds(tunnels, true); err != nil {
+		return err
+	}
+	return x.apply()
 }
 
 type threeMUser struct {
@@ -849,6 +868,9 @@ func (x *ThreeMUI) CloneToTunnels(templateID int, hosts []string, tunnels []*Tun
 			return created, fmt.Errorf("端口 %d 绑定出口失败: %w", port, err)
 		}
 	}
+	if err := x.apply(); err != nil {
+		return created, err
+	}
 	return created, nil
 }
 
@@ -963,7 +985,10 @@ func (x *ThreeMUI) UpdateInbound(id int, patch InboundPatch, tunnels []*Tunnel) 
 		seen[rule] = true
 		rules = append(rules, rule)
 	}
-	return x.patchRules(rules)
+	if err := x.patchRules(rules); err != nil {
+		return err
+	}
+	return x.apply()
 }
 
 func (x *ThreeMUI) DeleteInbounds(ids []int, tunnels []*Tunnel) error {
@@ -1034,7 +1059,10 @@ func (x *ThreeMUI) DeleteInbounds(ids []int, tunnels []*Tunnel) error {
 			return err
 		}
 	}
-	return x.syncOutbounds(tunnels, true)
+	if err := x.syncOutbounds(tunnels, true); err != nil {
+		return err
+	}
+	return x.apply()
 }
 
 func (x *ThreeMUI) AddClient(id int, email string, tunnels []*Tunnel) error {

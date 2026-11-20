@@ -60,6 +60,10 @@ func (m *threeMMock) panel() *ThreeMUI {
 	if err != nil {
 		m.t.Fatal(err)
 	}
+	// 生产环境 apply 改为后台异步执行；测试里用 WaitGroup 等待其完成，
+	// 避免断言 apply 次数/顺序时出现竞态，并防止测试结束后访问已关闭的 mock server。
+	p.applyWG = &sync.WaitGroup{}
+	m.t.Cleanup(func() { p.applyWG.Wait() })
 	return p
 }
 
@@ -412,7 +416,8 @@ func TestThreeMUICloneMergesBindingsAndWritesRoute(t *testing.T) {
 	m.routing.Rules = []string{"MATCH,DIRECT"}
 	tunnel := &Tunnel{Node: Node{HostName: "jp-home", CountryCode: "JP"}, Port: 23000, Status: "up", Cred: SocksCred{User: "u", Pass: "p"}}
 
-	ports, err := m.panel().CloneToTunnels(1, []string{"jp-home"}, []*Tunnel{tunnel})
+	p := m.panel()
+	ports, err := p.CloneToTunnels(1, []string{"jp-home"}, []*Tunnel{tunnel})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,6 +436,7 @@ func TestThreeMUICloneMergesBindingsAndWritesRoute(t *testing.T) {
 	if proxy["server"] != "127.0.0.1" || proxy["username"] != "u" || proxy["password"] != "p" {
 		t.Fatalf("SOCKS5 出站不对：%v", proxy)
 	}
+	p.applyWG.Wait()
 	if m.applyCount != 1 {
 		t.Fatalf("批量克隆后应只 apply 一次：%d", m.applyCount)
 	}
@@ -540,7 +546,8 @@ func TestThreeMUIDeleteRemovesRulesBeforeOutbounds(t *testing.T) {
 	// 新格式出站（国旗-fanout-端口），无规则引用，应被识别并清理
 	m.outbounds["🇯🇵 日本-fanout-99999"] = threeMProxy{"name": "🇯🇵 日本-fanout-99999", "type": "socks5"}
 
-	if err := m.panel().DeleteInbounds([]int{1}, nil); err != nil {
+	p := m.panel()
+	if err := p.DeleteInbounds([]int{1}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(m.routing.Rules, []string{"IN-NAME,保留,fanout-keep", "MATCH,DIRECT"}) {
@@ -567,6 +574,7 @@ func TestThreeMUIDeleteRemovesRulesBeforeOutbounds(t *testing.T) {
 	if patchAt < 0 || deleteAt < 0 || patchAt > deleteAt {
 		t.Fatalf("必须先删规则再删出站：%v", m.requests)
 	}
+	p.applyWG.Wait()
 	if m.applyCount != 1 {
 		t.Fatalf("删除后应 apply 一次：%d", m.applyCount)
 	}
@@ -636,9 +644,11 @@ func TestThreeMUIBindAppliesAfterRoute(t *testing.T) {
 	m.routing.Rules = []string{"MATCH,DIRECT"}
 	tunnel := &Tunnel{Node: Node{HostName: "us-home", CountryCode: "US"}, Port: 23001, Status: "up", Cred: SocksCred{User: "u", Pass: "p"}}
 
-	if err := m.panel().Bind(listenerTag(1), "us-home", []*Tunnel{tunnel}); err != nil {
+	p := m.panel()
+	if err := p.Bind(listenerTag(1), "us-home", []*Tunnel{tunnel}); err != nil {
 		t.Fatal(err)
 	}
+	p.applyWG.Wait()
 	if m.applyCount != 1 {
 		t.Fatalf("Bind 后应 apply 一次：%d", m.applyCount)
 	}

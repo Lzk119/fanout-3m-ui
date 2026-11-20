@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -394,6 +395,9 @@ type ThreeMUI struct {
 	token  string
 	// opMu 串行化路由写入及“临时改 PublicHost—导出—恢复”操作。
 	opMu sync.Mutex
+	// applyMu 串行化后台 apply，避免并发重载 Mihomo；applyWG 仅测试用，非 nil 时后台 apply 会 Done。
+	applyMu sync.Mutex
+	applyWG *sync.WaitGroup
 }
 
 func openThreeMUI(workDir string) (*ThreeMUI, error) {
@@ -772,6 +776,25 @@ func (x *ThreeMUI) apply() error {
 	return nil
 }
 
+// applyAsync 非阻塞地应用 3m-ui 配置：写操作（规则/出站已落库）成功后立即返回，
+// apply 放到后台串行执行，避免慢速重载 Mihomo 阻塞 HTTP 响应导致前端 "Failed to fetch"。
+// apply 失败只记日志——规则已落库，后续任意写操作都会再次 apply，最终一致。
+func (x *ThreeMUI) applyAsync() {
+	if x.applyWG != nil {
+		x.applyWG.Add(1)
+	}
+	go func() {
+		if x.applyWG != nil {
+			defer x.applyWG.Done()
+		}
+		x.applyMu.Lock()
+		defer x.applyMu.Unlock()
+		if err := x.apply(); err != nil {
+			log.Printf("后台应用 3m-ui 配置失败（规则已落库，下次操作会重试）: %v", err)
+		}
+	}()
+}
+
 // boundOutboundByTag 为每个有 IN-NAME 规则的入站返回其出站名（已反转义）。
 // 宽松识别：只要是 IN-NAME,<入站名>,<出站> 就算绑定，不要求出站是 fanout 管理的——
 // 用户手动绑到自建出站（如「洛杉矶」）的入站也不应被当成未绑定。
@@ -931,7 +954,9 @@ func (x *ThreeMUI) Bind(inboundTag, hostname string, tunnels []*Tunnel) error {
 	if err := x.bind(inboundTag, hostname, tunnels); err != nil {
 		return err
 	}
-	return x.apply()
+	// 规则已落库，立即返回；apply 后台执行，避免慢速重载阻塞响应导致前端 "Failed to fetch"。
+	x.applyAsync()
+	return nil
 }
 
 func (x *ThreeMUI) Rebind(oldHost string, target *Tunnel, tunnels []*Tunnel) error {
@@ -965,7 +990,8 @@ func (x *ThreeMUI) Rebind(oldHost string, target *Tunnel, tunnels []*Tunnel) err
 			return err
 		}
 	}
-	return x.apply()
+	x.applyAsync()
+	return nil
 }
 
 func (x *ThreeMUI) ResyncOutbound(t *Tunnel, tunnels []*Tunnel) error {
@@ -974,7 +1000,8 @@ func (x *ThreeMUI) ResyncOutbound(t *Tunnel, tunnels []*Tunnel) error {
 	if err := x.syncOutbounds(tunnels, false); err != nil {
 		return err
 	}
-	return x.apply()
+	x.applyAsync()
+	return nil
 }
 
 func (x *ThreeMUI) OnTunnelsChanged(tunnels []*Tunnel) error {
@@ -983,7 +1010,8 @@ func (x *ThreeMUI) OnTunnelsChanged(tunnels []*Tunnel) error {
 	if err := x.syncOutbounds(tunnels, true); err != nil {
 		return err
 	}
-	return x.apply()
+	x.applyAsync()
+	return nil
 }
 
 type threeMUser struct {
@@ -1141,9 +1169,7 @@ func (x *ThreeMUI) CloneToTunnels(templateID int, hosts []string, tunnels []*Tun
 			return created, fmt.Errorf("端口 %d 绑定出口失败: %w", port, err)
 		}
 	}
-	if err := x.apply(); err != nil {
-		return created, err
-	}
+	x.applyAsync()
 	return created, nil
 }
 
@@ -1261,7 +1287,8 @@ func (x *ThreeMUI) UpdateInbound(id int, patch InboundPatch, tunnels []*Tunnel) 
 			return err
 		}
 	}
-	return x.apply()
+	x.applyAsync()
+	return nil
 }
 
 func (x *ThreeMUI) DeleteInbounds(ids []int, tunnels []*Tunnel) error {
@@ -1336,7 +1363,8 @@ func (x *ThreeMUI) DeleteInbounds(ids []int, tunnels []*Tunnel) error {
 	if err := x.syncOutbounds(tunnels, true); err != nil {
 		return err
 	}
-	return x.apply()
+	x.applyAsync()
+	return nil
 }
 
 func (x *ThreeMUI) AddClient(id int, email string, tunnels []*Tunnel) error {

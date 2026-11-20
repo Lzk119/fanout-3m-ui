@@ -238,6 +238,8 @@ textarea:focus{outline:none;border-color:var(--accent)}
 
   <div id="list"></div>
 
+  <div id="boundelse"></div>
+
   <div id="orphans"></div>
 </main>
 
@@ -528,7 +530,7 @@ async function copy(text){
   toast(ok ? '已复制' : '复制失败，请手动选中', !ok);
 }
 
-let view = {exits:[], direct:[], panel:'', backend:'', public_ip:''};
+let view = {exits:[], bound_else:[], direct:[], panel:'', backend:'', public_ip:''};
 let inbounds = [];
 
 function backendName(){ return '3m-ui'; }
@@ -605,6 +607,33 @@ function renderOrphans(){
     + '</div>';
 }
 
+// 已绑定到非 fanout 出站（如手动在 3m-ui 绑到「洛杉矶」）的入站；单列出来，
+// 避免被当成未绑定走直连，仍可在这里换到 fanout 出口。
+function renderBoundElse(){
+  const box = $('#boundelse');
+  const list = view.bound_else || [];
+  if(!list.length){ box.innerHTML = ''; return; }
+  const hasUp = view.exits.some(e => e.status === 'up');
+  box.innerHTML = '<div class="orphan"><div class="top">'
+    + '<h3>已绑定到其它出口</h3><span class="count">' + list.length + ' 个</span>'
+    + '<span class="spacer"></span></div>'
+    + list.map(i =>
+        '<div class="orow">'
+        + '<button class="chip" data-detail="' + i.id + '" title="'
+        +   esc((i.remark || i.protocol) + ' · ' + i.protocol + ' :' + i.port) + '">'
+        +   esc(i.remark || i.protocol) + ' :' + i.port + '</button>'
+        + '<span class="dim">→ ' + esc(i.outbound || '?') + '</span>'
+        + '<span class="spacer"></span>'
+        + (hasUp
+            ? '<select class="obind" data-tag="' + esc(i.tag) + '">' + exitOptions('') + '</select>'
+            : '<span class="dim">先开一个出口</span>')
+        + '<button class="icon danger" data-delone="' + i.id + '" data-name="'
+          + esc((i.remark || i.protocol) + ' :' + i.port) + '" title="删除这个入站">'
+          + ICON.trash + '</button>'
+        + '</div>').join('')
+    + '</div>';
+}
+
 function renderJobs(jobs){
   const box = $('#jobs');
   box.innerHTML = jobs.map(j => {
@@ -630,6 +659,7 @@ async function poll(){
       ? (backendName() + ': ' + view.panel)
       : (view.panel_info || '');
     renderExits();
+    renderBoundElse();
     renderOrphans();
   }catch(e){}
   try{ renderJobs(await api('/api/jobs') || []); }catch(e){}
@@ -711,7 +741,8 @@ async function loadWizard(){
     // 所以把没绑出口的排在前面并默认选中
     const v = await api('/api/exits');
     const free = v.direct || [];
-    const bound = (v.exits || []).flatMap(e => e.inbounds || []);
+    const bound = (v.exits || []).flatMap(e => e.inbounds || [])
+      .concat(v.bound_else || []);
     inbounds = free.concat(bound);
     if(!inbounds.length){
       sel.innerHTML = '<option value="0">还没有节点</option>';

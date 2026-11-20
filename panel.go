@@ -7,8 +7,8 @@ type Panel interface {
 	Kind() string
 	Describe() string
 
-	Inbounds(live map[string]bool) ([]Inbound, error)
-	InboundDetail(id int, publicHost string) (*InboundDetail, error)
+	Inbounds(live map[string]bool, tunnels []*Tunnel) ([]Inbound, error)
+	InboundDetail(id int, publicHost string, tunnels []*Tunnel) (*InboundDetail, error)
 	InboundLinks(ids []int, publicHost string) ([]string, error)
 	InboundYAML(ids []int, publicHost string) (string, error)
 

@@ -112,7 +112,7 @@ func subInboundIDs(p Panel, m *Manager, boundOnly bool) ([]int, error) {
 		}
 		return ids, nil
 	}
-	list, err := p.Inbounds(nil)
+	list, err := p.Inbounds(nil, nil)
 	if err != nil {
 		return nil, err
 	}

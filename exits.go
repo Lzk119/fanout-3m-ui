@@ -13,6 +13,9 @@ type ExitInbound struct {
 	Protocol string `json:"protocol"`
 	Enable   bool   `json:"enable"`
 	Tag      string `json:"tag"`
+	// Outbound 是该入站 IN-NAME 规则指向的出站名；仅「已绑定到非 fanout 出口」时填写，
+	// 前端据此展示它绑到了哪个出站。
+	Outbound string `json:"outbound,omitempty"`
 }
 
 // Exit 是界面上的一行：一条隧道加上挂在它出口的所有入站。
@@ -36,6 +39,9 @@ type Exit struct {
 // ExitsView 是主界面需要的全部数据。
 type ExitsView struct {
 	Exits []Exit `json:"exits"`
+	// BoundElse 是有 IN-NAME 规则、但出站映射不到 fanout 隧道的入站（如手动绑到自建出站）；
+	// 单独列出，避免被误标成「未绑定走直连」。
+	BoundElse []ExitInbound `json:"bound_else"`
 	// Direct 是没绑到任何出口的入站，仍然要能看见，否则用户会以为它们不见了
 	Direct []ExitInbound `json:"direct"`
 	Panel  string        `json:"panel"` // 面板不可用时的原因，空表示正常
@@ -59,7 +65,7 @@ const inboundCacheTTL = 2500 * time.Millisecond
 
 var ibCache inboundCache
 
-func cachedInbounds(live map[string]bool) ([]Inbound, error) {
+func cachedInbounds(live map[string]bool, tunnels []*Tunnel) ([]Inbound, error) {
 	ibCache.mu.Lock()
 	defer ibCache.mu.Unlock()
 	if time.Since(ibCache.at) < inboundCacheTTL {
@@ -69,7 +75,7 @@ func cachedInbounds(live map[string]bool) ([]Inbound, error) {
 	var list []Inbound
 	x, err := openPanel()
 	if err == nil {
-		list, err = x.Inbounds(live)
+		list, err = x.Inbounds(live, tunnels)
 	}
 	ibCache.at, ibCache.list, ibCache.err = time.Now(), list, err
 	return list, err
@@ -112,7 +118,7 @@ func (m *Manager) ExitsOf() ExitsView {
 		})
 	}
 
-	list, err := cachedInbounds(live)
+	list, err := cachedInbounds(live, tunnels)
 	if err != nil {
 		view.Panel = err.Error()
 		return view
@@ -122,9 +128,15 @@ func (m *Manager) ExitsOf() ExitsView {
 		row := ExitInbound{
 			ID: ib.ID, Port: ib.Port, Remark: ib.Remark,
 			Protocol: ib.Protocol, Enable: ib.Enable, Tag: ib.Tag,
+			Outbound: ib.BoundOutbound,
 		}
 		if i, ok := byHost[ib.BoundTo]; ib.BoundTo != "" && ok {
 			view.Exits[i].Inbounds = append(view.Exits[i].Inbounds, row)
+			continue
+		}
+		// 有 IN-NAME 规则但映射不到 fanout 隧道：已绑定到其它出口，不算未绑定
+		if ib.BoundOutbound != "" {
+			view.BoundElse = append(view.BoundElse, row)
 			continue
 		}
 		view.Direct = append(view.Direct, row)

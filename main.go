@@ -125,7 +125,7 @@ func main() {
 	mux.HandleFunc("/api/xui/inbounds", apiXUIInbounds(mgr))
 	mux.HandleFunc("/api/xui/bind", apiXUIBind(mgr))
 	mux.HandleFunc("/api/xui/clone", apiXUIClone(mgr))
-	mux.HandleFunc("/api/xui/detail", apiXUIDetail)
+	mux.HandleFunc("/api/xui/detail", apiXUIDetail(mgr))
 	mux.HandleFunc("/api/xui/links", apiXUILinks)
 	mux.HandleFunc("/api/xui/delete", apiXUIDelete(mgr))
 	mux.HandleFunc("/api/panel/inbound/new", apiInboundCreate(mgr))
@@ -484,7 +484,7 @@ func apiXUIStatus(w http.ResponseWriter, r *http.Request) {
 // apiXUIInbounds 列出面板里已有的入站及其绑定状态。
 func apiXUIInbounds(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		list, err := cachedInbounds(liveHosts(m))
+		list, err := cachedInbounds(liveHosts(m), m.Tunnels())
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
@@ -573,27 +573,29 @@ func apiXUIClone(m *Manager) http.HandlerFunc {
 }
 
 // apiXUIDetail 返回某个入站的详情，含客户端与可直接复制的分享链接。
-func apiXUIDetail(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(r.URL.Query().Get("id"))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id 参数无效"})
-		return
+func apiXUIDetail(m *Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(r.URL.Query().Get("id"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id 参数无效"})
+			return
+		}
+		x, err := openPanel()
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+		host := r.URL.Query().Get("host")
+		if host == "" {
+			host = publicHost(r)
+		}
+		detail, err := x.InboundDetail(id, host, m.Tunnels())
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, detail)
 	}
-	x, err := openPanel()
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-		return
-	}
-	host := r.URL.Query().Get("host")
-	if host == "" {
-		host = publicHost(r)
-	}
-	detail, err := x.InboundDetail(id, host)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, detail)
 }
 
 // publicHost 决定分享链接里的连接地址。母机公网 IPv4 才是客户端真正能连上
@@ -628,7 +630,7 @@ func apiXUILinks(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		list, err := x.Inbounds(nil)
+		list, err := x.Inbounds(nil, nil)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return

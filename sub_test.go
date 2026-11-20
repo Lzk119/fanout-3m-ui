@@ -20,10 +20,10 @@ type fakePanel struct {
 
 func (f *fakePanel) Kind() string     { return "fake" }
 func (f *fakePanel) Describe() string { return "测试用" }
-func (f *fakePanel) Inbounds(live map[string]bool) ([]Inbound, error) {
+func (f *fakePanel) Inbounds(live map[string]bool, tunnels []*Tunnel) ([]Inbound, error) {
 	return f.inbounds, nil
 }
-func (f *fakePanel) InboundDetail(id int, publicHost string) (*InboundDetail, error) {
+func (f *fakePanel) InboundDetail(id int, publicHost string, tunnels []*Tunnel) (*InboundDetail, error) {
 	return nil, fmt.Errorf("用不到")
 }
 func (f *fakePanel) InboundLinks(ids []int, publicHost string) ([]string, error) {

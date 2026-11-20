@@ -709,6 +709,45 @@ func TestThreeMUIBindCleansLegacyInPort(t *testing.T) {
 	}
 }
 
+// TestThreeMUIInboundsResolvesBoundFromRule 验证绑定状态从 IN-NAME 规则的出站反查，
+// 不再依赖 Listener 名称格式；覆盖非 exitLabel 命名与自建出站两种场景。
+func TestThreeMUIInboundsResolvesBoundFromRule(t *testing.T) {
+	m := newThreeMMock(t)
+	// Listener 名是「国家 协议」格式（非 exitLabel）：旧逻辑会把末段协议当 hostname，导致显示未绑定
+	m.listeners[1] = threeMListener{ID: 1, Name: "🇯🇵 日本 Anytls", Protocol: "anytls", Port: "10001", Enabled: true}
+	m.listeners[2] = threeMListener{ID: 2, Name: "🇺🇸 美国 Trojan", Protocol: "trojan", Port: "10002", Enabled: true}
+	m.listeners[3] = threeMListener{ID: 3, Name: "未绑定节点", Protocol: "vless", Port: "10003", Enabled: true}
+	jp := &Tunnel{Node: Node{HostName: "jp-home", CountryCode: "JP", Country: "日本"}, Port: 42829, Status: "up"}
+	tunnels := []*Tunnel{jp}
+	m.routing.Rules = []string{
+		"IN-NAME,🇯🇵 日本 Anytls,🇯🇵 日本-fanout-42829", // 日本：fanout 出站，尾部端口定位隧道
+		"IN-NAME,🇺🇸 美国 Trojan,🇺🇸 洛杉矶",             // 美国：自建出站，无 fanout 后缀
+		"MATCH,DIRECT",
+	}
+	live := map[string]bool{"jp-home": true}
+
+	list, err := m.panel().Inbounds(live, tunnels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byTag := map[string]Inbound{}
+	for _, ib := range list {
+		byTag[ib.Tag] = ib
+	}
+	// 日本：从规则出站尾部端口反查到 jp-home，不应再取 Listener 名末段 "Anytls"
+	if got := byTag[listenerTag(1)]; got.BoundTo != "jp-home" || !got.BoundUp || got.BoundOutbound != "🇯🇵 日本-fanout-42829" {
+		t.Fatalf("日本入站绑定解析错误：%+v", got)
+	}
+	// 美国：识别为已绑定（有出站名），但映射不到 fanout 隧道 → BoundTo 为空，归入「已绑定到其它出口」
+	if got := byTag[listenerTag(2)]; got.BoundTo != "" || got.BoundOutbound != "🇺🇸 洛杉矶" {
+		t.Fatalf("美国自建出站绑定解析错误：%+v", got)
+	}
+	// 无规则：未绑定
+	if got := byTag[listenerTag(3)]; got.BoundTo != "" || got.BoundOutbound != "" {
+		t.Fatalf("未绑定入站不应有绑定信息：%+v", got)
+	}
+}
+
 // TestProbeThreeMUIURLFromPath 验证从 3m-ui config.yaml 自动探测本地地址的各种分支。
 func TestProbeThreeMUIURLFromPath(t *testing.T) {
 	writeCfg := func(t *testing.T, content string) string {

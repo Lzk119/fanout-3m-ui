@@ -37,6 +37,9 @@ type Inbound struct {
 	Tag      string `json:"tag"`
 	BoundTo  string `json:"bound_to"`
 	BoundUp  bool   `json:"bound_up"`
+	// BoundOutbound 是该入站 IN-NAME 规则指向的出站名（已反转义），无规则为空；
+	// 用来区分「已绑定但映射不到 fanout 出口」与「真正未绑定」。
+	BoundOutbound string `json:"bound_outbound,omitempty"`
 }
 
 // InboundDetail 是 Listener、代理用户和分享链接的完整详情。
@@ -99,15 +102,6 @@ func outboundPort(name string) (int, bool) {
 		return 0, false
 	}
 	return port, true
-}
-
-// remarkHost 从 Listener 备注（exitLabel 格式「🇯🇵 日本 jp-home」）末段取 sanitize 后的 hostname。
-func remarkHost(remark string) string {
-	fields := strings.Fields(remark)
-	if len(fields) == 0 {
-		return ""
-	}
-	return fields[len(fields)-1]
 }
 
 // unescapeFlagEmoji 把字面 \Uxxxxxxxx 还原成真实字符。
@@ -778,26 +772,69 @@ func (x *ThreeMUI) apply() error {
 	return nil
 }
 
-func boundListeners(list []threeMListener, cfg threeMRouting) map[string]string {
-	// 收集有 fanout 规则（IN-NAME）的入站名；fanoutRule 已反转义，可直接匹配 Listener 名称。
-	managedNames := map[string]bool{}
+// boundOutboundByTag 为每个有 IN-NAME 规则的入站返回其出站名（已反转义）。
+// 宽松识别：只要是 IN-NAME,<入站名>,<出站> 就算绑定，不要求出站是 fanout 管理的——
+// 用户手动绑到自建出站（如「洛杉矶」）的入站也不应被当成未绑定。
+// 同一入站有多条规则时取最靠前（最高优先级）的一条，与 Mihomo 首条匹配语义一致。
+func boundOutboundByTag(list []threeMListener, cfg threeMRouting) map[string]string {
+	outboundByName := map[string]string{}
 	for _, rule := range cfg.Rules {
-		if inbound, _, ok := fanoutRule(rule); ok && inbound != "" {
-			managedNames[inbound] = true
-		}
-	}
-	bound := map[string]string{}
-	for _, l := range list {
-		if !managedNames[l.Name] {
+		parts := strings.Split(rule, ",")
+		if len(parts) != 3 {
 			continue
 		}
-		// BoundTo（hostname）从 Listener 备注末段反推（exitLabel 格式「🇯🇵 日本 jp-home」）
-		bound[listenerTag(l.ID)] = remarkHost(l.Name)
+		if strings.ToUpper(strings.TrimSpace(parts[0])) != "IN-NAME" {
+			continue
+		}
+		inbound := unescapeFlagEmoji(strings.TrimSpace(parts[1]))
+		outbound := unescapeFlagEmoji(strings.TrimSpace(parts[2]))
+		if inbound == "" || outbound == "" {
+			continue
+		}
+		if _, exists := outboundByName[inbound]; exists {
+			continue // 保留最靠前的规则
+		}
+		outboundByName[inbound] = outbound
 	}
-	return bound
+	out := map[string]string{}
+	for _, l := range list {
+		if ob, ok := outboundByName[l.Name]; ok {
+			out[listenerTag(l.ID)] = ob
+		}
+	}
+	return out
 }
 
-func (x *ThreeMUI) Inbounds(live map[string]bool) ([]Inbound, error) {
+// tunnelHostMaps 从隧道构建两张反查表：fanout 出站尾部端口→sanitize hostname，
+// 以及 nodeLabel→sanitize hostname，供把入站规则的出站名映射回 fanout 出口。
+func tunnelHostMaps(tunnels []*Tunnel) (map[int]string, map[string]string) {
+	portToHost := map[int]string{}
+	labelToHost := map[string]string{}
+	for _, t := range tunnels {
+		h := sanitizeTag(t.Node.HostName)
+		portToHost[t.Port] = h
+		if label := nodeLabel(t.Node); label != "" {
+			labelToHost[label] = h
+		}
+	}
+	return portToHost, labelToHost
+}
+
+// resolveHost 把出站名反查到 fanout 出口 hostname（sanitize 后）。
+// 优先用 fanout 出站名尾部的 SOCKS5 端口定位隧道；找不到再退回出站名等于某隧道 nodeLabel。
+func resolveHost(outbound string, portToHost map[int]string, labelToHost map[string]string) string {
+	if port, ok := outboundPort(outbound); ok {
+		if h, ok := portToHost[port]; ok {
+			return h
+		}
+	}
+	if h, ok := labelToHost[outbound]; ok {
+		return h
+	}
+	return ""
+}
+
+func (x *ThreeMUI) Inbounds(live map[string]bool, tunnels []*Tunnel) ([]Inbound, error) {
 	x.opMu.Lock()
 	defer x.opMu.Unlock()
 	list, err := x.listeners()
@@ -808,14 +845,18 @@ func (x *ThreeMUI) Inbounds(live map[string]bool) ([]Inbound, error) {
 	if err != nil {
 		return nil, err
 	}
-	bound := boundListeners(list, cfg)
+	// 绑定状态与出口都从 IN-NAME 规则的出站反查，不再依赖 Listener 名称格式；
+	// 这样 Listener 被改成「国家 协议」之类非 exitLabel 名称时仍能正确显示绑定。
+	outboundByTag := boundOutboundByTag(list, cfg)
+	portToHost, labelToHost := tunnelHostMaps(tunnels)
 	out := make([]Inbound, 0, len(list))
 	for _, l := range list {
 		ib, err := inboundOf(l)
 		if err != nil {
 			return nil, err
 		}
-		ib.BoundTo = bound[ib.Tag]
+		ib.BoundOutbound = outboundByTag[ib.Tag]
+		ib.BoundTo = resolveHost(ib.BoundOutbound, portToHost, labelToHost)
 		ib.BoundUp = live[ib.BoundTo]
 		out = append(out, ib)
 	}
@@ -904,11 +945,13 @@ func (x *ThreeMUI) Rebind(oldHost string, target *Tunnel, tunnels []*Tunnel) err
 	if err != nil {
 		return err
 	}
-	bound := boundListeners(list, cfg)
+	// 从 IN-NAME 规则的出站反查隧道，找出当前绑在 oldHost 出口上的入站（不依赖 Listener 名格式）
+	outboundByTag := boundOutboundByTag(list, cfg)
+	portToHost, labelToHost := tunnelHostMaps(tunnels)
 	newLabel := exitLabel(target)
 	for _, l := range list {
 		tag := listenerTag(l.ID)
-		if bound[tag] != sanitizeTag(oldHost) {
+		if resolveHost(outboundByTag[tag], portToHost, labelToHost) != sanitizeTag(oldHost) {
 			continue
 		}
 		// 先改备注名（exitLabel），保证后续 bind 写入的 IN-NAME 规则入站名与 Listener 新名一致
@@ -1427,7 +1470,7 @@ func (x *ThreeMUI) export(id int, publicHost string) (threeMExport, error) {
 	return result, nil
 }
 
-func (x *ThreeMUI) InboundDetail(id int, publicHost string) (*InboundDetail, error) {
+func (x *ThreeMUI) InboundDetail(id int, publicHost string, tunnels []*Tunnel) (*InboundDetail, error) {
 	x.opMu.Lock()
 	defer x.opMu.Unlock()
 	listener, err := x.listener(id)
@@ -1446,7 +1489,11 @@ func (x *ThreeMUI) InboundDetail(id int, publicHost string) (*InboundDetail, err
 	if err != nil {
 		return nil, err
 	}
-	ib.BoundTo = boundListeners(list, cfg)[ib.Tag]
+	// 绑定状态从 IN-NAME 规则的出站反查隧道，与列表页保持一致
+	outboundByTag := boundOutboundByTag(list, cfg)
+	portToHost, labelToHost := tunnelHostMaps(tunnels)
+	ib.BoundOutbound = outboundByTag[ib.Tag]
+	ib.BoundTo = resolveHost(ib.BoundOutbound, portToHost, labelToHost)
 	detail := &InboundDetail{Inbound: ib, Listen: listener.Listen}
 	if detail.Listen == "" {
 		detail.Listen = listener.BindAddress

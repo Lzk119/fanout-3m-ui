@@ -409,7 +409,7 @@ func TestThreeMUICloneMergesBindingsAndWritesRoute(t *testing.T) {
 	m.users[7] = threeMUser{ID: 7, Username: "alice", Enabled: true}
 	m.bindings[7] = []int{1, 2}
 	m.routing.Rules = []string{"MATCH,DIRECT"}
-	tunnel := &Tunnel{Node: Node{HostName: "jp-home"}, Port: 23000, Status: "up", Cred: SocksCred{User: "u", Pass: "p"}}
+	tunnel := &Tunnel{Node: Node{HostName: "jp-home", CountryCode: "JP"}, Port: 23000, Status: "up", Cred: SocksCred{User: "u", Pass: "p"}}
 
 	ports, err := m.panel().CloneToTunnels(1, []string{"jp-home"}, []*Tunnel{tunnel})
 	if err != nil {
@@ -422,11 +422,11 @@ func TestThreeMUICloneMergesBindingsAndWritesRoute(t *testing.T) {
 	if !reflect.DeepEqual(m.bindings[7], []int{1, 2, 3}) {
 		t.Fatalf("旧用户绑定被覆盖：%v", m.bindings[7])
 	}
-	wantRule := fmt.Sprintf("IN-PORT,%d,fanout-jp-home", ports[0])
+	wantRule := fmt.Sprintf("IN-PORT,%d,🇯🇵 日本-fanout-23000", ports[0])
 	if !reflect.DeepEqual(m.routing.Rules, []string{wantRule, "MATCH,DIRECT"}) {
 		t.Fatalf("IN-PORT 应插到 MATCH 前：%v", m.routing.Rules)
 	}
-	proxy := m.outbounds["fanout-jp-home"]
+	proxy := m.outbounds["🇯🇵 日本-fanout-23000"]
 	if proxy["server"] != "127.0.0.1" || proxy["username"] != "u" || proxy["password"] != "p" {
 		t.Fatalf("SOCKS5 出站不对：%v", proxy)
 	}
@@ -438,7 +438,7 @@ func TestThreeMUICloneMergesBindingsAndWritesRoute(t *testing.T) {
 func TestThreeMUIUpdateInboundMigratesPortRule(t *testing.T) {
 	m := newThreeMMock(t)
 	m.listeners[1] = threeMListener{ID: 1, Name: "旧名", Protocol: "vless", Port: "10001", Enabled: true}
-	m.routing.Rules = []string{"IN-PORT,10001,fanout-jp-home", "MATCH,DIRECT"}
+	m.routing.Rules = []string{"IN-PORT,10001,🇯🇵 日本-fanout-23000", "MATCH,DIRECT"}
 	newPort, newName := 12000, "新名"
 	if err := m.panel().UpdateInbound(1, InboundPatch{Port: &newPort, Remark: &newName}, nil); err != nil {
 		t.Fatal(err)
@@ -446,7 +446,7 @@ func TestThreeMUIUpdateInboundMigratesPortRule(t *testing.T) {
 	if m.listeners[1].Port != "12000" || m.listeners[1].Name != "新名" {
 		t.Fatalf("Listener 未完整更新：%+v", m.listeners[1])
 	}
-	want := []string{"IN-PORT,12000,fanout-jp-home", "MATCH,DIRECT"}
+	want := []string{"IN-PORT,12000,🇯🇵 日本-fanout-23000", "MATCH,DIRECT"}
 	if !reflect.DeepEqual(m.routing.Rules, want) {
 		t.Fatalf("旧端口路由未迁移：%v", m.routing.Rules)
 	}
@@ -526,6 +526,8 @@ func TestThreeMUIDeleteRemovesRulesBeforeOutbounds(t *testing.T) {
 	m.routing.Rules = []string{"IN-PORT,10001,fanout-old", "IN-PORT,10002,fanout-keep", "MATCH,DIRECT"}
 	m.outbounds["fanout-old"] = threeMProxy{"name": "fanout-old", "type": "socks5"}
 	m.outbounds["fanout-keep"] = threeMProxy{"name": "fanout-keep", "type": "socks5"}
+	// 新格式出站（国旗-fanout-端口），无规则引用，应被识别并清理
+	m.outbounds["🇯🇵 日本-fanout-99999"] = threeMProxy{"name": "🇯🇵 日本-fanout-99999", "type": "socks5"}
 
 	if err := m.panel().DeleteInbounds([]int{1}, nil); err != nil {
 		t.Fatal(err)
@@ -538,6 +540,9 @@ func TestThreeMUIDeleteRemovesRulesBeforeOutbounds(t *testing.T) {
 	}
 	if _, exists := m.outbounds["fanout-keep"]; !exists {
 		t.Fatal("仍被路由引用的出站位不能删除")
+	}
+	if _, exists := m.outbounds["🇯🇵 日本-fanout-99999"]; exists {
+		t.Fatal("新格式无引用出站应被识别并删除")
 	}
 	patchAt, deleteAt := -1, -1
 	for i, request := range m.requests {
@@ -618,7 +623,7 @@ func TestThreeMUIBindAppliesAfterRoute(t *testing.T) {
 	m := newThreeMMock(t)
 	m.listeners[1] = threeMListener{ID: 1, Name: "入口", Protocol: "vless", Port: "10001", Enabled: true}
 	m.routing.Rules = []string{"MATCH,DIRECT"}
-	tunnel := &Tunnel{Node: Node{HostName: "us-home"}, Port: 23001, Status: "up", Cred: SocksCred{User: "u", Pass: "p"}}
+	tunnel := &Tunnel{Node: Node{HostName: "us-home", CountryCode: "US"}, Port: 23001, Status: "up", Cred: SocksCred{User: "u", Pass: "p"}}
 
 	if err := m.panel().Bind(listenerTag(1), "us-home", []*Tunnel{tunnel}); err != nil {
 		t.Fatal(err)
@@ -644,7 +649,7 @@ func TestThreeMUIBindAppliesAfterRoute(t *testing.T) {
 	if !(outboundAt < patchAt && patchAt < applyAt) {
 		t.Fatalf("请求顺序应为 出站→规则→apply：%v", m.requests)
 	}
-	want := []string{"IN-PORT,10001,fanout-us-home", "MATCH,DIRECT"}
+	want := []string{"IN-PORT,10001,🇺🇸 美国-fanout-23001", "MATCH,DIRECT"}
 	if !reflect.DeepEqual(m.routing.Rules, want) {
 		t.Fatalf("绑定规则不对：%v", m.routing.Rules)
 	}

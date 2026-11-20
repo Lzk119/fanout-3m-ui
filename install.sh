@@ -61,23 +61,70 @@ save_prestate() {
   chmod 600 "$f"
 }
 
-# 从 3m-ui 自身的 /etc/3m-ui/config.yaml 探测端口与 web_path，拼出本地回环地址。
-# 安装时用来自动生成 panel.yaml 的 url，用户只需补 username/password。
-# 探测失败（文件不存在/无 port）输出空，由调用方走手动提示。
+# 探测 3m-ui 实际监听端口并测连通性，拼出可用的本地回环地址。
+# config.yaml 的 server.port 不可靠（启用 HTTPS 后常被忽略，实际监听 443/80），
+# 因此以 3m-ui-bin 进程的真实监听端口为准，逐个测 http/https，取第一个返回 200/302 的。
+# 成功输出 URL（http:// 或 https:// 开头），失败输出空，由调用方走手动提示。
 detect_3mui_url() {
   local cfg="/etc/3m-ui/config.yaml"
-  [[ -f "$cfg" ]] || return 0
-  local port webpath
-  port=$(sed -n 's/^[[:space:]]*port:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$cfg" | head -1)
-  webpath=$(sed -n 's/^[[:space:]]*web_path:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$cfg" | head -1)
-  [[ -z "$port" ]] && return 0
+  local webpath=""
+  if [[ -f "$cfg" ]]; then
+    webpath=$(sed -n 's/^[[:space:]]*web_path:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$cfg" | head -1 || true)
+  fi
   # 去掉首尾斜杠，与 Go 端 probeThreeMUIURL 保持一致
   webpath=${webpath#/}; webpath=${webpath%/}
-  if [[ -n "$webpath" ]]; then
-    echo "http://127.0.0.1:${port}/${webpath}"
-  else
-    echo "http://127.0.0.1:${port}"
+
+  # 候选端口集合（去重、保序）：真实监听端口优先，config 的 server.port 兜底
+  local -a candidates=()
+  local seen=" "
+  add_port() {
+    if [[ -z "$1" || "$1" =~ [^0-9] ]]; then
+      return 0
+    fi
+    case "$seen" in *" $1 "*) return 0 ;; esac
+    seen="${seen}$1 "
+    candidates+=("$1")
+    return 0
+  }
+  # 优先：ss 查 3m-ui-bin 的监听端口
+  if command -v ss >/dev/null 2>&1; then
+    local addr
+    while IFS= read -r addr; do
+      add_port "${addr##*:}"
+    done < <(ss -tlnH 2>/dev/null | grep -i '3m-ui-bin' | awk '{print $4}' || true)
   fi
+  # 兜底：ss 无结果时，从 /proc/net/tcp 取所有 LISTEN（状态 0A）端口
+  if [[ ${#candidates[@]} -eq 0 ]] && [[ -r /proc/net/tcp ]]; then
+    local hex
+    while IFS= read -r hex; do
+      [[ -n "$hex" ]] && add_port "$((16#${hex##*:}))"
+    done < <(awk '$4=="0A"{print $2}' /proc/net/tcp 2>/dev/null || true)
+  fi
+  # config 的 server.port 作为兜底候选（可能未监听，但也测一下）
+  if [[ -f "$cfg" ]]; then
+    add_port "$(sed -n 's/^[[:space:]]*port:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$cfg" | head -1 || true)"
+  fi
+
+  [[ ${#candidates[@]} -eq 0 ]] && return 0
+
+  local base=""
+  [[ -n "$webpath" ]] && base="/${webpath}"
+  local p code
+  for p in "${candidates[@]}"; do
+    # 先测 https：3m-ui 启用 TLS 时常只监听 443
+    code=$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 3 "https://127.0.0.1:${p}${base}" 2>/dev/null || echo 000)
+    if [[ "$code" == "200" || "$code" == "302" ]]; then
+      echo "https://127.0.0.1:${p}${base}"
+      return 0
+    fi
+    # 再测 http
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${p}${base}" 2>/dev/null || echo 000)
+    if [[ "$code" == "200" || "$code" == "302" ]]; then
+      echo "http://127.0.0.1:${p}${base}"
+      return 0
+    fi
+  done
+  return 0
 }
 
 svc_install() {
@@ -236,21 +283,56 @@ if [[ -s "${WORK_DIR}/panel.yaml" ]]; then
   echo "      使用 ${WORK_DIR}/panel.yaml"
 else
   auto_url=$(detect_3mui_url || true)
+
+  # 收集 3m-ui 登录凭据：交互终端直接输入，非交互（curl|bash）走环境变量
+  panel_user=""
+  panel_pass=""
+  if [[ -t 0 ]]; then
+    echo "      请输入 3m-ui 登录凭据（回车留空则稍后手动填写）"
+    read -rp "      用户名: " panel_user
+    read -rsp "      密码: " panel_pass; echo
+    read -rsp "      确认密码: " panel_pass2; echo
+    if [[ "$panel_pass" != "$panel_pass2" ]]; then
+      echo "      两次密码不一致，已留空，请稍后手动编辑填写"
+      panel_pass=""
+    fi
+  else
+    panel_user="${FANOUT_3M_UI_USERNAME:-}"
+    panel_pass="${FANOUT_3M_UI_PASSWORD:-}"
+  fi
+
   if [[ -n "$auto_url" ]]; then
-    # 自动探测到 3m-ui 地址：生成模板，url 已填好，用户只需补账号密码
-    cat > "${WORK_DIR}/panel.yaml" <<EOF
-url: "${auto_url}"   # 已从 /etc/3m-ui/config.yaml 自动探测，可手动覆盖
-username: ""          # ← 改成你的 3m-ui 登录用户名
-password: ""          # ← 改成你的 3m-ui 登录密码
-# totp_code: ""       # 仅面板启用动态验证码时需要
-# insecure_skip_verify: true   # 仅本地 HTTPS 自签证书时开启
-EOF
+    # 自动探测到 3m-ui 地址：生成模板，url 已填好；https 时自动开启 insecure_skip_verify
+    {
+      printf 'url: "%s"   # 已自动探测，可手动覆盖\n' "$auto_url"
+      printf 'username: "%s"\n' "$panel_user"
+      printf 'password: "%s"\n' "$panel_pass"
+      printf '# totp_code: ""       # 仅面板启用动态验证码时需要\n'
+      if [[ "$auto_url" == https://* ]]; then
+        printf 'insecure_skip_verify: true   # 本地 HTTPS 自签证书需开启\n'
+      else
+        printf '# insecure_skip_verify: true   # 仅本地 HTTPS 自签证书时开启\n'
+      fi
+    } > "${WORK_DIR}/panel.yaml"
     chmod 600 "${WORK_DIR}/panel.yaml"
     echo "      已自动探测 3m-ui 地址（${auto_url}）并生成 ${WORK_DIR}/panel.yaml"
-    echo "      请编辑该文件填入 username/password 后重启服务"
+    if [[ -z "$panel_user" || -z "$panel_pass" ]]; then
+      echo "      请编辑该文件补全 username/password 后重启服务"
+    else
+      echo "      凭据已写入，启动服务即可连接"
+    fi
   else
-    echo "      尚未配置 3m-ui；安装后请创建 ${WORK_DIR}/panel.yaml 并重启服务"
-    echo "      配置项：url、username、password，可选 totp_code、insecure_skip_verify"
+    # 未探测到地址：生成空模板，url 留空让用户填，凭据若有则一并写入
+    {
+      printf 'url: ""                # 改成你的 3m-ui 地址，如 http://127.0.0.1:8080/<web_path>\n'
+      printf 'username: "%s"\n' "$panel_user"
+      printf 'password: "%s"\n' "$panel_pass"
+      printf '# totp_code: ""\n'
+      printf '# insecure_skip_verify: true   # 仅本地 HTTPS 自签证书时开启\n'
+    } > "${WORK_DIR}/panel.yaml"
+    chmod 600 "${WORK_DIR}/panel.yaml"
+    echo "      未能自动探测 3m-ui 地址，已生成模板 ${WORK_DIR}/panel.yaml"
+    echo "      请填写 url（及 username/password）后重启服务"
   fi
 fi
 

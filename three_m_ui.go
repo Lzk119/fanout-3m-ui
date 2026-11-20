@@ -61,8 +61,54 @@ type NewInboundSpec struct {
 	Remark   string
 }
 
-// fanout- 前缀标识本程序管理的 Mihomo 出站，避免碰到用户自己的配置。
-func tunnelTag(t *Tunnel) string { return fanoutTagPrefix + sanitizeTag(t.Node.HostName) }
+// 出站名格式：国旗 国家-fanout-端口，靠 fanout 分配的 SOCKS5 端口保证唯一；
+// 识别靠尾部 fanout-<数字>，避免与用户自建出站（可能国旗开头）冲突。
+func tunnelTag(t *Tunnel) string {
+	return nodeLabel(t.Node) + "-fanout-" + strconv.Itoa(t.Port)
+}
+
+// isFanoutOutbound 判断出站是否由 fanout 管理：新格式尾部 fanout-<数字>，或兼容旧 fanout- 前缀。
+func isFanoutOutbound(name string) bool {
+	if strings.HasPrefix(name, fanoutTagPrefix) {
+		return true
+	}
+	idx := strings.LastIndex(name, "-fanout-")
+	if idx < 0 {
+		return false
+	}
+	suffix := name[idx+len("-fanout-"):]
+	if suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// outboundPort 从 fanout 出站名尾部提取 SOCKS5 端口，非 fanout 出站返回 false。
+func outboundPort(name string) (int, bool) {
+	idx := strings.LastIndex(name, "-fanout-")
+	if idx < 0 {
+		return 0, false
+	}
+	port, err := strconv.Atoi(name[idx+len("-fanout-"):])
+	if err != nil || port <= 0 {
+		return 0, false
+	}
+	return port, true
+}
+
+// remarkHost 从 Listener 备注（exitLabel 格式「🇯🇵 日本 jp-home」）末段取 sanitize 后的 hostname。
+func remarkHost(remark string) string {
+	fields := strings.Fields(remark)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[len(fields)-1]
+}
 
 func listenerTag(id int) string { return fmt.Sprintf("%s%d", listenerTagPrefix, id) }
 
@@ -508,7 +554,7 @@ func (x *ThreeMUI) syncOutbounds(tunnels []*Tunnel, cleanup bool) error {
 	}
 	for _, entry := range existing {
 		name := proxyName(entry.Proxy)
-		if !strings.HasPrefix(name, fanoutTagPrefix) || desired[name] || routingReferences(cfg, name) {
+		if !isFanoutOutbound(name) || desired[name] || routingReferences(cfg, name) {
 			continue
 		}
 		if err := x.do(http.MethodDelete, "/config/server-outbounds?name="+url.QueryEscape(name), nil, nil); err != nil {
@@ -554,7 +600,7 @@ func fanoutRule(rule string) (port int, target string, ok bool) {
 		return 0, "", false
 	}
 	target = strings.TrimSpace(parts[2])
-	if !strings.HasPrefix(target, fanoutTagPrefix) {
+	if !isFanoutOutbound(target) {
 		return 0, "", false
 	}
 	port, err := strconv.Atoi(strings.TrimSpace(parts[1]))
@@ -593,21 +639,21 @@ func (x *ThreeMUI) apply() error {
 }
 
 func boundListeners(list []threeMListener, cfg threeMRouting) map[string]string {
-	ports := map[int]string{}
-	for _, l := range list {
-		if port, err := listenerPort(l); err == nil {
-			ports[port] = listenerTag(l.ID)
+	// 收集有 fanout 路由规则的 listener 端口
+	managedPorts := map[int]bool{}
+	for _, rule := range cfg.Rules {
+		if port, _, ok := fanoutRule(rule); ok {
+			managedPorts[port] = true
 		}
 	}
 	bound := map[string]string{}
-	for _, rule := range cfg.Rules {
-		port, target, ok := fanoutRule(rule)
-		if !ok {
+	for _, l := range list {
+		port, err := listenerPort(l)
+		if err != nil || !managedPorts[port] {
 			continue
 		}
-		if tag, exists := ports[port]; exists {
-			bound[tag] = strings.TrimPrefix(target, fanoutTagPrefix)
-		}
+		// 出站名不再含 hostname，从 Listener 备注（exitLabel 格式「🇯🇵 日本 jp-home」）末段反推
+		bound[listenerTag(l.ID)] = remarkHost(l.Name)
 	}
 	return bound
 }

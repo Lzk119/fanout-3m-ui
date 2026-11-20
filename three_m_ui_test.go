@@ -423,9 +423,11 @@ func TestThreeMUICloneMergesBindingsAndWritesRoute(t *testing.T) {
 	if !reflect.DeepEqual(m.bindings[7], []int{1, 2, 3}) {
 		t.Fatalf("旧用户绑定被覆盖：%v", m.bindings[7])
 	}
-	wantRule := fmt.Sprintf("IN-PORT,%d,🇯🇵 日本-fanout-23000", ports[0])
+	wantRule := fmt.Sprintf("IN-NAME,%s,%s",
+		escapeFlagEmoji(m.listeners[3].Name),
+		escapeFlagEmoji(tunnelTag(tunnel)))
 	if !reflect.DeepEqual(m.routing.Rules, []string{wantRule, "MATCH,DIRECT"}) {
-		t.Fatalf("IN-PORT 应插到 MATCH 前：%v", m.routing.Rules)
+		t.Fatalf("IN-NAME 应插到最顶部：%v", m.routing.Rules)
 	}
 	proxy := m.outbounds["🇯🇵 日本-fanout-23000"]
 	if proxy["server"] != "127.0.0.1" || proxy["username"] != "u" || proxy["password"] != "p" {
@@ -436,23 +438,33 @@ func TestThreeMUICloneMergesBindingsAndWritesRoute(t *testing.T) {
 	}
 }
 
-func TestThreeMUIUpdateInboundMigratesPortRule(t *testing.T) {
+func TestThreeMUIUpdateInboundRenamesRuleInbound(t *testing.T) {
 	m := newThreeMMock(t)
 	m.listeners[1] = threeMListener{ID: 1, Name: "旧名", Protocol: "vless", Port: "10001", Enabled: true}
-	m.routing.Rules = []string{"IN-PORT,10001,🇯🇵 日本-fanout-23000", "MATCH,DIRECT"}
-	newPort, newName := 12000, "新名"
-	if err := m.panel().UpdateInbound(1, InboundPatch{Port: &newPort, Remark: &newName}, nil); err != nil {
+	outbound := escapeFlagEmoji("🇯🇵 日本-fanout-23000")
+	m.routing.Rules = []string{fmt.Sprintf("IN-NAME,旧名,%s", outbound), "MATCH,DIRECT"}
+	// 改备注：应同步更新 IN-NAME 规则的入站名，出站保持转义形式不变
+	newName := "新名"
+	if err := m.panel().UpdateInbound(1, InboundPatch{Remark: &newName}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if m.listeners[1].Port != "12000" || m.listeners[1].Name != "新名" {
-		t.Fatalf("Listener 未完整更新：%+v", m.listeners[1])
+	if m.listeners[1].Name != "新名" {
+		t.Fatalf("Listener 名称未更新：%+v", m.listeners[1])
 	}
-	want := []string{"IN-PORT,12000,🇯🇵 日本-fanout-23000", "MATCH,DIRECT"}
+	want := []string{fmt.Sprintf("IN-NAME,新名,%s", outbound), "MATCH,DIRECT"}
 	if !reflect.DeepEqual(m.routing.Rules, want) {
-		t.Fatalf("旧端口路由未迁移：%v", m.routing.Rules)
+		t.Fatalf("入站名未同步到规则：%v", m.routing.Rules)
 	}
-	if m.applyCount != 1 {
-		t.Fatalf("改端口迁移规则后应 apply 一次：%d", m.applyCount)
+	// 仅改端口不依赖入站名，不应变动 IN-NAME 规则
+	newPort := 12000
+	if err := m.panel().UpdateInbound(1, InboundPatch{Port: &newPort}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if m.listeners[1].Port != "12000" {
+		t.Fatalf("端口未更新：%+v", m.listeners[1])
+	}
+	if !reflect.DeepEqual(m.routing.Rules, want) {
+		t.Fatalf("改端口不应变动规则：%v", m.routing.Rules)
 	}
 }
 
@@ -524,7 +536,7 @@ func TestThreeMUIDeleteRemovesRulesBeforeOutbounds(t *testing.T) {
 	m := newThreeMMock(t)
 	m.listeners[1] = threeMListener{ID: 1, Name: "删除", Port: "10001", Enabled: true}
 	m.listeners[2] = threeMListener{ID: 2, Name: "保留", Port: "10002", Enabled: true}
-	m.routing.Rules = []string{"IN-PORT,10001,fanout-old", "IN-PORT,10002,fanout-keep", "MATCH,DIRECT"}
+	m.routing.Rules = []string{"IN-NAME,删除,fanout-old", "IN-NAME,保留,fanout-keep", "MATCH,DIRECT"}
 	m.outbounds["fanout-old"] = threeMProxy{"name": "fanout-old", "type": "socks5"}
 	m.outbounds["fanout-keep"] = threeMProxy{"name": "fanout-keep", "type": "socks5"}
 	// 新格式出站（国旗-fanout-端口），无规则引用，应被识别并清理
@@ -533,8 +545,8 @@ func TestThreeMUIDeleteRemovesRulesBeforeOutbounds(t *testing.T) {
 	if err := m.panel().DeleteInbounds([]int{1}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(m.routing.Rules, []string{"IN-PORT,10002,fanout-keep", "MATCH,DIRECT"}) {
-		t.Fatalf("失效路由未删除：%v", m.routing.Rules)
+	if !reflect.DeepEqual(m.routing.Rules, []string{"IN-NAME,保留,fanout-keep", "MATCH,DIRECT"}) {
+		t.Fatalf("失效入站的规则未删除：%v", m.routing.Rules)
 	}
 	if _, exists := m.outbounds["fanout-old"]; exists {
 		t.Fatal("无引用的旧出站应删除")
@@ -650,9 +662,54 @@ func TestThreeMUIBindAppliesAfterRoute(t *testing.T) {
 	if !(outboundAt < patchAt && patchAt < applyAt) {
 		t.Fatalf("请求顺序应为 出站→规则→apply：%v", m.requests)
 	}
-	want := []string{"IN-PORT,10001,🇺🇸 美国-fanout-23001", "MATCH,DIRECT"}
+	want := []string{
+		fmt.Sprintf("IN-NAME,入口,%s", escapeFlagEmoji(tunnelTag(tunnel))),
+		"MATCH,DIRECT",
+	}
 	if !reflect.DeepEqual(m.routing.Rules, want) {
 		t.Fatalf("绑定规则不对：%v", m.routing.Rules)
+	}
+}
+
+// TestEscapeFlagEmoji 验证国旗 emoji 与 \Uxxxxxxxx 字面形式的互转，非国旗字符保持不变。
+func TestEscapeFlagEmoji(t *testing.T) {
+	in := "🇭🇰 香港 Hy2 → 🇯🇵 日本"
+	want := "\\U0001F1ED\\U0001F1F0 香港 Hy2 → \\U0001F1EF\\U0001F1F5 日本"
+	if got := escapeFlagEmoji(in); got != want {
+		t.Fatalf("转义不对：got %q want %q", got, want)
+	}
+	if back := unescapeFlagEmoji(escapeFlagEmoji(in)); back != in {
+		t.Fatalf("反转义未还原：got %q want %q", back, in)
+	}
+	if escapeFlagEmoji("日本-fanout-23000") != "日本-fanout-23000" {
+		t.Fatal("非国旗字符不应被转义")
+	}
+}
+
+// TestThreeMUIBindCleansLegacyInPort 验证绑定时清理历史 IN-PORT 残留、保留其他入站的 IN-NAME、新规则置顶。
+func TestThreeMUIBindCleansLegacyInPort(t *testing.T) {
+	m := newThreeMMock(t)
+	m.listeners[1] = threeMListener{ID: 1, Name: "入口A", Protocol: "vless", Port: "10001", Enabled: true}
+	m.listeners[2] = threeMListener{ID: 2, Name: "入口B", Protocol: "vless", Port: "10002", Enabled: true}
+	// 历史 IN-PORT 残留 + 其他入站已有的 IN-NAME 绑定 + 用户自建规则
+	m.routing.Rules = []string{
+		"IN-PORT,10001,fanout-legacy",
+		"IN-NAME,入口B,fanout-other",
+		"DOMAIN,example.com,DIRECT",
+		"MATCH,DIRECT",
+	}
+	tunnel := &Tunnel{Node: Node{HostName: "jp-home", CountryCode: "JP"}, Port: 23000, Status: "up"}
+	if err := m.panel().Bind(listenerTag(1), "jp-home", []*Tunnel{tunnel}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		fmt.Sprintf("IN-NAME,入口A,%s", escapeFlagEmoji(tunnelTag(tunnel))),
+		"IN-NAME,入口B,fanout-other",
+		"DOMAIN,example.com,DIRECT",
+		"MATCH,DIRECT",
+	}
+	if !reflect.DeepEqual(m.routing.Rules, want) {
+		t.Fatalf("规则清理/置顶不对：%v", m.routing.Rules)
 	}
 }
 

@@ -110,6 +110,38 @@ func remarkHost(remark string) string {
 	return fields[len(fields)-1]
 }
 
+// escapeFlagEmoji 把国旗 emoji（区域指示符 U+1F1E6..U+1F1FF）转成字面 \Uxxxxxxxx 形式。
+// 3m-ui 生成 config.yaml 时，原始国旗 emoji 会让 IN-NAME 规则匹配失败，必须用转义形式写入规则。
+func escapeFlagEmoji(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 0x1F1E6 && r <= 0x1F1FF {
+			fmt.Fprintf(&b, "\\U%08X", r)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// unescapeFlagEmoji 把字面 \Uxxxxxxxx 还原成真实字符，用于解析已有规则时匹配原始 Listener 名称。
+func unescapeFlagEmoji(s string) string {
+	runes := []rune(s)
+	var b strings.Builder
+	for i := 0; i < len(runes); i++ {
+		// 识别 \U 后跟 8 位十六进制
+		if runes[i] == '\\' && i+9 < len(runes) && runes[i+1] == 'U' {
+			if cp, err := strconv.ParseInt(string(runes[i+2:i+10]), 16, 32); err == nil {
+				b.WriteRune(rune(cp))
+				i += 9
+				continue
+			}
+		}
+		b.WriteRune(runes[i])
+	}
+	return b.String()
+}
+
 func listenerTag(id int) string { return fmt.Sprintf("%s%d", listenerTagPrefix, id) }
 
 func sanitizeTag(name string) string {
@@ -694,7 +726,8 @@ func routingReferences(cfg threeMRouting, name string) bool {
 	for _, rule := range cfg.Rules {
 		parts := strings.Split(rule, ",")
 		for _, part := range parts[1:] {
-			if strings.TrimSpace(part) == name {
+			// fanout 写入的 IN-NAME 规则中出站名是国旗转义形式，需还原后再比较
+			if unescapeFlagEmoji(strings.TrimSpace(part)) == name {
 				return true
 			}
 		}
@@ -719,33 +752,26 @@ func routingReferences(cfg threeMRouting, name string) bool {
 	return false
 }
 
-func fanoutRule(rule string) (port int, target string, ok bool) {
+// fanoutRule 解析 fanout 写入的路由规则，返回 (入站标识, 出站名, ok)。
+// 当前用 IN-NAME,<入站名>,<出站>；历史 IN-PORT,<端口>,<出站> 也识别（仅用于迁移清理）。
+// 入站名与出站名均已反转义回原始字符（含国旗 emoji），便于和 Listener 名称、出站名直接比较。
+func fanoutRule(rule string) (inbound, outbound string, ok bool) {
 	parts := strings.Split(rule, ",")
-	if len(parts) != 3 || !strings.EqualFold(strings.TrimSpace(parts[0]), "IN-PORT") {
-		return 0, "", false
+	if len(parts) != 3 {
+		return "", "", false
 	}
-	target = strings.TrimSpace(parts[2])
-	if !isFanoutOutbound(target) {
-		return 0, "", false
+	outbound = unescapeFlagEmoji(strings.TrimSpace(parts[2]))
+	if !isFanoutOutbound(outbound) {
+		return "", "", false
 	}
-	port, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if err != nil {
-		return 0, "", false
+	switch strings.ToUpper(strings.TrimSpace(parts[0])) {
+	case "IN-NAME":
+		return unescapeFlagEmoji(strings.TrimSpace(parts[1])), outbound, true
+	case "IN-PORT":
+		// 历史格式，入站标识为端口；迁移清理时识别，正常绑定不再使用
+		return strings.TrimSpace(parts[1]), outbound, true
 	}
-	return port, target, true
-}
-
-func putBeforeMatch(rules []string, rule string) []string {
-	for i, current := range rules {
-		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(current)), "MATCH,") {
-			out := make([]string, 0, len(rules)+1)
-			out = append(out, rules[:i]...)
-			out = append(out, rule)
-			out = append(out, rules[i:]...)
-			return out
-		}
-	}
-	return append(rules, rule)
+	return "", "", false
 }
 
 func (x *ThreeMUI) patchRules(rules []string) error {
@@ -764,20 +790,19 @@ func (x *ThreeMUI) apply() error {
 }
 
 func boundListeners(list []threeMListener, cfg threeMRouting) map[string]string {
-	// 收集有 fanout 路由规则的 listener 端口
-	managedPorts := map[int]bool{}
+	// 收集有 fanout 规则（IN-NAME）的入站名；fanoutRule 已反转义，可直接匹配 Listener 名称。
+	managedNames := map[string]bool{}
 	for _, rule := range cfg.Rules {
-		if port, _, ok := fanoutRule(rule); ok {
-			managedPorts[port] = true
+		if inbound, _, ok := fanoutRule(rule); ok && inbound != "" {
+			managedNames[inbound] = true
 		}
 	}
 	bound := map[string]string{}
 	for _, l := range list {
-		port, err := listenerPort(l)
-		if err != nil || !managedPorts[port] {
+		if !managedNames[l.Name] {
 			continue
 		}
-		// 出站名不再含 hostname，从 Listener 备注（exitLabel 格式「🇯🇵 日本 jp-home」）末段反推
+		// BoundTo（hostname）从 Listener 备注末段反推（exitLabel 格式「🇯🇵 日本 jp-home」）
 		bound[listenerTag(l.ID)] = remarkHost(l.Name)
 	}
 	return bound
@@ -830,20 +855,16 @@ func (x *ThreeMUI) bind(inboundTag, hostname string, tunnels []*Tunnel) error {
 		return err
 	}
 	var selected *threeMListener
-	alivePorts := map[int]bool{}
 	for i := range list {
-		port, err := listenerPort(list[i])
-		if err != nil {
-			return err
-		}
-		alivePorts[port] = true
 		if listenerTag(list[i].ID) == inboundTag {
 			selected = &list[i]
+			break
 		}
 	}
 	if selected == nil {
 		return fmt.Errorf("Listener %s 不存在", inboundTag)
 	}
+	// 先确保目标 fanout 出站已存在，再通过 IN-NAME 路由规则把入站绑定到该出站。
 	if err := x.syncOutbounds(tunnels, false); err != nil {
 		return err
 	}
@@ -851,17 +872,25 @@ func (x *ThreeMUI) bind(inboundTag, hostname string, tunnels []*Tunnel) error {
 	if err != nil {
 		return err
 	}
-	selectedPort, _ := listenerPort(*selected)
+	// 重写 rules：移除该入站旧的 fanout 规则（换绑/解绑），并清理历史 IN-PORT 残留；
+	// 其他入站的 IN-NAME 规则原样保留。
 	rules := make([]string, 0, len(cfg.Rules)+1)
 	for _, rule := range cfg.Rules {
-		port, _, managed := fanoutRule(rule)
-		if managed && (!alivePorts[port] || port == selectedPort) {
+		inbound, _, ok := fanoutRule(rule)
+		if !ok {
+			rules = append(rules, rule)
+			continue
+		}
+		kind := strings.ToUpper(strings.TrimSpace(strings.Split(rule, ",")[0]))
+		if kind == "IN-PORT" || inbound == selected.Name {
 			continue
 		}
 		rules = append(rules, rule)
 	}
 	if target != nil {
-		rules = putBeforeMatch(rules, fmt.Sprintf("IN-PORT,%d,%s", selectedPort, tunnelTag(target)))
+		// 新规则插到最顶部；国旗 emoji 转义为 \Uxxxxxxxx，确保 3m-ui 生成的 config.yaml 能被 mihomo 正确解析。
+		newRule := fmt.Sprintf("IN-NAME,%s,%s", escapeFlagEmoji(selected.Name), escapeFlagEmoji(tunnelTag(target)))
+		rules = append([]string{newRule}, rules...)
 	}
 	return x.patchRules(rules)
 }
@@ -893,14 +922,15 @@ func (x *ThreeMUI) Rebind(oldHost string, target *Tunnel, tunnels []*Tunnel) err
 		if bound[tag] != sanitizeTag(oldHost) {
 			continue
 		}
-		if err := x.bind(tag, target.Node.HostName, tunnels); err != nil {
-			return err
-		}
+		// 先改备注名（exitLabel），保证后续 bind 写入的 IN-NAME 规则入站名与 Listener 新名一致
 		if renamed := renameExitLabel(l.Name, newLabel); renamed != l.Name {
 			l.Name = renamed
 			if err := x.do(http.MethodPut, fmt.Sprintf("/listeners/%d", l.ID), l, nil); err != nil {
 				return err
 			}
+		}
+		if err := x.bind(tag, target.Node.HostName, tunnels); err != nil {
+			return err
 		}
 	}
 	return x.apply()
@@ -1164,6 +1194,7 @@ func (x *ThreeMUI) UpdateInbound(id int, patch InboundPatch, tunnels []*Tunnel) 
 			listener.Port = strconv.Itoa(newPort)
 		}
 	}
+	oldName := listener.Name
 	if patch.Remark != nil {
 		if strings.TrimSpace(*patch.Remark) == "" {
 			return fmt.Errorf("备注不能为空")
@@ -1176,28 +1207,27 @@ func (x *ThreeMUI) UpdateInbound(id int, patch InboundPatch, tunnels []*Tunnel) 
 	if err := x.do(http.MethodPut, fmt.Sprintf("/listeners/%d", id), listener, nil); err != nil {
 		return err
 	}
-	if newPort == oldPort {
+	// 端口或备注未变则无需动规则（IN-NAME 不依赖端口；enable 变更由 PUT 即时生效）
+	if newPort == oldPort && listener.Name == oldName {
 		return nil
 	}
-	cfg, err := x.routing()
-	if err != nil {
-		return err
-	}
-	rules := make([]string, 0, len(cfg.Rules))
-	seen := map[string]bool{}
-	for _, rule := range cfg.Rules {
-		port, target, managed := fanoutRule(rule)
-		if managed && port == oldPort {
-			rule = fmt.Sprintf("IN-PORT,%d,%s", newPort, target)
+	// 备注变更时，同步 rules 中该入站的 IN-NAME 入站名（旧名→新名），国旗保持转义形式
+	if listener.Name != oldName {
+		cfg, err := x.routing()
+		if err != nil {
+			return err
 		}
-		if seen[rule] {
-			continue
+		rules := make([]string, 0, len(cfg.Rules))
+		for _, rule := range cfg.Rules {
+			inbound, outbound, ok := fanoutRule(rule)
+			if ok && inbound == oldName {
+				rule = fmt.Sprintf("IN-NAME,%s,%s", escapeFlagEmoji(listener.Name), escapeFlagEmoji(outbound))
+			}
+			rules = append(rules, rule)
 		}
-		seen[rule] = true
-		rules = append(rules, rule)
-	}
-	if err := x.patchRules(rules); err != nil {
-		return err
+		if err := x.patchRules(rules); err != nil {
+			return err
+		}
 	}
 	return x.apply()
 }
@@ -1222,13 +1252,10 @@ func (x *ThreeMUI) DeleteInbounds(ids []int, tunnels []*Tunnel) error {
 	if err != nil {
 		return err
 	}
-	alivePorts := map[int]bool{}
+	// 收集存活 Listener 名称，用于清理入站已删除的 IN-NAME 规则
+	aliveNames := map[string]bool{}
 	for _, l := range list {
-		port, err := listenerPort(l)
-		if err != nil {
-			return err
-		}
-		alivePorts[port] = true
+		aliveNames[l.Name] = true
 	}
 	cfg, err := x.routing()
 	if err != nil {
@@ -1236,13 +1263,17 @@ func (x *ThreeMUI) DeleteInbounds(ids []int, tunnels []*Tunnel) error {
 	}
 	rules := make([]string, 0, len(cfg.Rules))
 	for _, rule := range cfg.Rules {
-		port, _, managed := fanoutRule(rule)
-		if managed && !alivePorts[port] {
-			continue
+		inbound, _, ok := fanoutRule(rule)
+		if ok {
+			kind := strings.ToUpper(strings.TrimSpace(strings.Split(rule, ",")[0]))
+			// 入站已删除的 IN-NAME 规则、以及历史 IN-PORT 残留，一律清理
+			if kind == "IN-PORT" || !aliveNames[inbound] {
+				continue
+			}
 		}
 		rules = append(rules, rule)
 	}
-	// 先移除引用规则，再允许后续清理出站。
+	// 先移除失效规则，再允许后续清理出站。
 	if err := x.patchRules(rules); err != nil {
 		return err
 	}

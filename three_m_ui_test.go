@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -645,5 +647,76 @@ func TestThreeMUIBindAppliesAfterRoute(t *testing.T) {
 	want := []string{"IN-PORT,10001,fanout-us-home", "MATCH,DIRECT"}
 	if !reflect.DeepEqual(m.routing.Rules, want) {
 		t.Fatalf("绑定规则不对：%v", m.routing.Rules)
+	}
+}
+
+// TestProbeThreeMUIURLFromPath 验证从 3m-ui config.yaml 自动探测本地地址的各种分支。
+func TestProbeThreeMUIURLFromPath(t *testing.T) {
+	writeCfg := func(t *testing.T, content string) string {
+		t.Helper()
+		f := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(f, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name: "port+web_path",
+			content: `
+server:
+    port: 8080
+    web_path: /8a27cdfe1eda567f3593be4e1da527ad
+`,
+			want: "http://127.0.0.1:8080/8a27cdfe1eda567f3593be4e1da527ad",
+		},
+		{
+			name: "web_path 带首尾斜杠应被清理",
+			content: `
+server:
+    port: 9000
+    web_path: /abc/
+`,
+			want: "http://127.0.0.1:9000/abc",
+		},
+		{
+			name: "无 web_path",
+			content: `
+server:
+    port: 8080
+`,
+			want: "http://127.0.0.1:8080",
+		},
+		{
+			name: "port 缺失返回空",
+			content: `
+server:
+    web_path: /abc
+`,
+			want: "",
+		},
+		{
+			name:    "非 YAML 返回空",
+			content: "this is: not: valid: yaml: [[[",
+			want:    "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := probeThreeMUIURLFromPath(writeCfg(t, tt.content))
+			if got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	// 文件不存在应返回空，而不是 panic
+	if got := probeThreeMUIURLFromPath(filepath.Join(t.TempDir(), "nope.yaml")); got != "" {
+		t.Fatalf("不存在的文件应返回空，got %q", got)
 	}
 }

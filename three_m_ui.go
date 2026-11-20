@@ -115,6 +115,42 @@ type threeMUIConfig struct {
 	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
 }
 
+// threeMUIConfigPath 是 3m-ui 自身配置文件的固定路径，用于在用户未显式配置 url 时自动探测。
+const threeMUIConfigPath = "/etc/3m-ui/config.yaml"
+
+// probeThreeMUIURL 从 3m-ui 自身的 config.yaml 读取 server.port 与 server.web_path，
+// 拼出本地回环 API 地址（默认 http）。仅当用户未在 panel.yaml/环境变量显式配置 url 时兜底使用。
+// 探测失败（文件不存在、解析失败、缺 port）返回空字符串，交由上层报错提示手动配置。
+func probeThreeMUIURL() string {
+	return probeThreeMUIURLFromPath(threeMUIConfigPath)
+}
+
+// probeThreeMUIURLFromPath 从指定路径读取 3m-ui config.yaml 并拼接本地地址，拆出参数便于测试。
+func probeThreeMUIURLFromPath(path string) string {
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var raw struct {
+		Server struct {
+			Port    int    `yaml:"port"`
+			WebPath string `yaml:"web_path"`
+		} `yaml:"server"`
+	}
+	if err := yaml.Unmarshal(blob, &raw); err != nil {
+		return ""
+	}
+	if raw.Server.Port <= 0 {
+		return ""
+	}
+	// 去掉 web_path 首尾斜杠，避免拼出双斜杠或尾斜杠（newThreeMUI 会统一补 /api/v1）
+	webPath := strings.Trim(raw.Server.WebPath, "/")
+	if webPath != "" {
+		return fmt.Sprintf("http://127.0.0.1:%d/%s", raw.Server.Port, webPath)
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d", raw.Server.Port)
+}
+
 func loadThreeMUIConfig(workDir string) (threeMUIConfig, error) {
 	var cfg threeMUIConfig
 	if workDir != "" {
@@ -143,6 +179,10 @@ func loadThreeMUIConfig(workDir string) (threeMUIConfig, error) {
 			return cfg, fmt.Errorf("FANOUT_3M_UI_INSECURE_SKIP_VERIFY 必须是布尔值")
 		}
 		cfg.InsecureSkipVerify = parsed
+	}
+	// 显式配置（panel.yaml / 环境变量）优先；都没给 url 时，从 3m-ui 自身 config.yaml 自动探测端口与 web_path
+	if cfg.URL == "" {
+		cfg.URL = probeThreeMUIURL()
 	}
 	cfg.URL = strings.TrimRight(strings.TrimSpace(cfg.URL), "/")
 	cfg.Username = strings.TrimSpace(cfg.Username)

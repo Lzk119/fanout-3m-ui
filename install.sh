@@ -61,6 +61,25 @@ save_prestate() {
   chmod 600 "$f"
 }
 
+# 从 3m-ui 自身的 /etc/3m-ui/config.yaml 探测端口与 web_path，拼出本地回环地址。
+# 安装时用来自动生成 panel.yaml 的 url，用户只需补 username/password。
+# 探测失败（文件不存在/无 port）输出空，由调用方走手动提示。
+detect_3mui_url() {
+  local cfg="/etc/3m-ui/config.yaml"
+  [[ -f "$cfg" ]] || return 0
+  local port webpath
+  port=$(sed -n 's/^[[:space:]]*port:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$cfg" | head -1)
+  webpath=$(sed -n 's/^[[:space:]]*web_path:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$cfg" | head -1)
+  [[ -z "$port" ]] && return 0
+  # 去掉首尾斜杠，与 Go 端 probeThreeMUIURL 保持一致
+  webpath=${webpath#/}; webpath=${webpath%/}
+  if [[ -n "$webpath" ]]; then
+    echo "http://127.0.0.1:${port}/${webpath}"
+  else
+    echo "http://127.0.0.1:${port}"
+  fi
+}
+
 svc_install() {
   if [[ "$INIT_SYS" == systemd ]]; then
     # 端口不写进服务文件：它由 ${WORK_DIR}/settings.json 决定（见 seed_settings），
@@ -216,8 +235,23 @@ if [[ -s "${WORK_DIR}/panel.yaml" ]]; then
   chmod 600 "${WORK_DIR}/panel.yaml"
   echo "      使用 ${WORK_DIR}/panel.yaml"
 else
-  echo "      尚未配置 3m-ui；安装后请创建 ${WORK_DIR}/panel.yaml 并重启服务"
-  echo "      配置项：url、username、password，可选 totp_code、insecure_skip_verify"
+  auto_url=$(detect_3mui_url || true)
+  if [[ -n "$auto_url" ]]; then
+    # 自动探测到 3m-ui 地址：生成模板，url 已填好，用户只需补账号密码
+    cat > "${WORK_DIR}/panel.yaml" <<EOF
+url: "${auto_url}"   # 已从 /etc/3m-ui/config.yaml 自动探测，可手动覆盖
+username: ""          # ← 改成你的 3m-ui 登录用户名
+password: ""          # ← 改成你的 3m-ui 登录密码
+# totp_code: ""       # 仅面板启用动态验证码时需要
+# insecure_skip_verify: true   # 仅本地 HTTPS 自签证书时开启
+EOF
+    chmod 600 "${WORK_DIR}/panel.yaml"
+    echo "      已自动探测 3m-ui 地址（${auto_url}）并生成 ${WORK_DIR}/panel.yaml"
+    echo "      请编辑该文件填入 username/password 后重启服务"
+  else
+    echo "      尚未配置 3m-ui；安装后请创建 ${WORK_DIR}/panel.yaml 并重启服务"
+    echo "      配置项：url、username、password，可选 totp_code、insecure_skip_verify"
+  fi
 fi
 
 # 改 sysctl/iptables 前先快照原始状态，卸载时据此精确恢复

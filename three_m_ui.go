@@ -110,21 +110,10 @@ func remarkHost(remark string) string {
 	return fields[len(fields)-1]
 }
 
-// escapeFlagEmoji 把国旗 emoji（区域指示符 U+1F1E6..U+1F1FF）转成字面 \Uxxxxxxxx 形式。
-// 3m-ui 生成 config.yaml 时，原始国旗 emoji 会让 IN-NAME 规则匹配失败，必须用转义形式写入规则。
-func escapeFlagEmoji(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if r >= 0x1F1E6 && r <= 0x1F1FF {
-			fmt.Fprintf(&b, "\\U%08X", r)
-		} else {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-// unescapeFlagEmoji 把字面 \Uxxxxxxxx 还原成真实字符，用于解析已有规则时匹配原始 Listener 名称。
+// unescapeFlagEmoji 把字面 \Uxxxxxxxx 还原成真实字符。
+// 写入规则时直接用原始 emoji：3m-ui 生成 config.yaml 用 yaml.Marshal，会自动给含 emoji 的
+// 字符串加双引号并转义为 \Uxxxxxxxx，mihomo 读取时还原成 emoji，与出站名一致；
+// 此函数仅用于解析历史遗留的 \U 字面规则（v0.1.5 写入），与原始 Listener/出站名称匹配。
 func unescapeFlagEmoji(s string) string {
 	runes := []rune(s)
 	var b strings.Builder
@@ -888,8 +877,8 @@ func (x *ThreeMUI) bind(inboundTag, hostname string, tunnels []*Tunnel) error {
 		rules = append(rules, rule)
 	}
 	if target != nil {
-		// 新规则插到最顶部；国旗 emoji 转义为 \Uxxxxxxxx，确保 3m-ui 生成的 config.yaml 能被 mihomo 正确解析。
-		newRule := fmt.Sprintf("IN-NAME,%s,%s", escapeFlagEmoji(selected.Name), escapeFlagEmoji(tunnelTag(target)))
+		// 新规则插到最顶部；直接用原始 emoji 名称，3m-ui 的 yaml.Marshal 会自动加双引号并转义，mihomo 可正确解析。
+		newRule := fmt.Sprintf("IN-NAME,%s,%s", selected.Name, tunnelTag(target))
 		rules = append([]string{newRule}, rules...)
 	}
 	return x.patchRules(rules)
@@ -1211,7 +1200,7 @@ func (x *ThreeMUI) UpdateInbound(id int, patch InboundPatch, tunnels []*Tunnel) 
 	if newPort == oldPort && listener.Name == oldName {
 		return nil
 	}
-	// 备注变更时，同步 rules 中该入站的 IN-NAME 入站名（旧名→新名），国旗保持转义形式
+	// 备注变更时，同步 rules 中该入站的 IN-NAME 入站名（旧名→新名）；outbound 已由 fanoutRule 还原为原始 emoji。
 	if listener.Name != oldName {
 		cfg, err := x.routing()
 		if err != nil {
@@ -1221,7 +1210,7 @@ func (x *ThreeMUI) UpdateInbound(id int, patch InboundPatch, tunnels []*Tunnel) 
 		for _, rule := range cfg.Rules {
 			inbound, outbound, ok := fanoutRule(rule)
 			if ok && inbound == oldName {
-				rule = fmt.Sprintf("IN-NAME,%s,%s", escapeFlagEmoji(listener.Name), escapeFlagEmoji(outbound))
+				rule = fmt.Sprintf("IN-NAME,%s,%s", listener.Name, outbound)
 			}
 			rules = append(rules, rule)
 		}

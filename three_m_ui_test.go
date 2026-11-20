@@ -423,9 +423,7 @@ func TestThreeMUICloneMergesBindingsAndWritesRoute(t *testing.T) {
 	if !reflect.DeepEqual(m.bindings[7], []int{1, 2, 3}) {
 		t.Fatalf("旧用户绑定被覆盖：%v", m.bindings[7])
 	}
-	wantRule := fmt.Sprintf("IN-NAME,%s,%s",
-		escapeFlagEmoji(m.listeners[3].Name),
-		escapeFlagEmoji(tunnelTag(tunnel)))
+	wantRule := fmt.Sprintf("IN-NAME,%s,%s", m.listeners[3].Name, tunnelTag(tunnel))
 	if !reflect.DeepEqual(m.routing.Rules, []string{wantRule, "MATCH,DIRECT"}) {
 		t.Fatalf("IN-NAME 应插到最顶部：%v", m.routing.Rules)
 	}
@@ -441,9 +439,9 @@ func TestThreeMUICloneMergesBindingsAndWritesRoute(t *testing.T) {
 func TestThreeMUIUpdateInboundRenamesRuleInbound(t *testing.T) {
 	m := newThreeMMock(t)
 	m.listeners[1] = threeMListener{ID: 1, Name: "旧名", Protocol: "vless", Port: "10001", Enabled: true}
-	outbound := escapeFlagEmoji("🇯🇵 日本-fanout-23000")
+	outbound := "🇯🇵 日本-fanout-23000"
 	m.routing.Rules = []string{fmt.Sprintf("IN-NAME,旧名,%s", outbound), "MATCH,DIRECT"}
-	// 改备注：应同步更新 IN-NAME 规则的入站名，出站保持转义形式不变
+	// 改备注：应同步更新 IN-NAME 规则的入站名，出站保持不变
 	newName := "新名"
 	if err := m.panel().UpdateInbound(1, InboundPatch{Remark: &newName}, nil); err != nil {
 		t.Fatal(err)
@@ -663,7 +661,7 @@ func TestThreeMUIBindAppliesAfterRoute(t *testing.T) {
 		t.Fatalf("请求顺序应为 出站→规则→apply：%v", m.requests)
 	}
 	want := []string{
-		fmt.Sprintf("IN-NAME,入口,%s", escapeFlagEmoji(tunnelTag(tunnel))),
+		fmt.Sprintf("IN-NAME,入口,%s", tunnelTag(tunnel)),
 		"MATCH,DIRECT",
 	}
 	if !reflect.DeepEqual(m.routing.Rules, want) {
@@ -671,18 +669,16 @@ func TestThreeMUIBindAppliesAfterRoute(t *testing.T) {
 	}
 }
 
-// TestEscapeFlagEmoji 验证国旗 emoji 与 \Uxxxxxxxx 字面形式的互转，非国旗字符保持不变。
-func TestEscapeFlagEmoji(t *testing.T) {
-	in := "🇭🇰 香港 Hy2 → 🇯🇵 日本"
-	want := "\\U0001F1ED\\U0001F1F0 香港 Hy2 → \\U0001F1EF\\U0001F1F5 日本"
-	if got := escapeFlagEmoji(in); got != want {
-		t.Fatalf("转义不对：got %q want %q", got, want)
+// TestUnescapeFlagEmoji 验证历史遗留的 \Uxxxxxxxx 字面规则能还原为真实 emoji，非转义字符串保持不变。
+func TestUnescapeFlagEmoji(t *testing.T) {
+	in := "\\U0001F1ED\\U0001F1F0 香港 Hy2 → \\U0001F1EF\\U0001F1F5 日本"
+	want := "🇭🇰 香港 Hy2 → 🇯🇵 日本"
+	if got := unescapeFlagEmoji(in); got != want {
+		t.Fatalf("还原不对：got %q want %q", got, want)
 	}
-	if back := unescapeFlagEmoji(escapeFlagEmoji(in)); back != in {
-		t.Fatalf("反转义未还原：got %q want %q", back, in)
-	}
-	if escapeFlagEmoji("日本-fanout-23000") != "日本-fanout-23000" {
-		t.Fatal("非国旗字符不应被转义")
+	// 非转义字符串保持不变
+	if unescapeFlagEmoji("日本-fanout-23000") != "日本-fanout-23000" {
+		t.Fatal("非转义字符不应被改动")
 	}
 }
 
@@ -703,7 +699,7 @@ func TestThreeMUIBindCleansLegacyInPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		fmt.Sprintf("IN-NAME,入口A,%s", escapeFlagEmoji(tunnelTag(tunnel))),
+		fmt.Sprintf("IN-NAME,入口A,%s", tunnelTag(tunnel)),
 		"IN-NAME,入口B,fanout-other",
 		"DOMAIN,example.com,DIRECT",
 		"MATCH,DIRECT",

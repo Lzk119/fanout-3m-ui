@@ -86,19 +86,23 @@ detect_3mui_url() {
     candidates+=("$1")
     return 0
   }
-  # 优先：ss 查 3m-ui-bin 的监听端口
+  # 优先：ss 查 3m-ui-bin 的监听端口（必须 -p 才显示进程名，否则 grep 不到 3m-ui-bin）
   if command -v ss >/dev/null 2>&1; then
     local addr
     while IFS= read -r addr; do
       add_port "${addr##*:}"
-    done < <(ss -tlnH 2>/dev/null | grep -i '3m-ui-bin' | awk '{print $4}' || true)
+    done < <(ss -tlnpH 2>/dev/null | grep -i '3m-ui-bin' | awk '{print $4}' || true)
   fi
-  # 兜底：ss 无结果时，从 /proc/net/tcp 取所有 LISTEN（状态 0A）端口
-  if [[ ${#candidates[@]} -eq 0 ]] && [[ -r /proc/net/tcp ]]; then
-    local hex
-    while IFS= read -r hex; do
-      [[ -n "$hex" ]] && add_port "$((16#${hex##*:}))"
-    done < <(awk '$4=="0A"{print $2}' /proc/net/tcp 2>/dev/null || true)
+  # 兜底：ss 无结果时，从 /proc/net/tcp 与 /proc/net/tcp6 取所有 LISTEN（状态 0A）端口。
+  # 3m-ui 常监听 *:443（IPv6 双栈），只在 tcp6 里出现，必须两个文件都读，否则会漏掉 443/80。
+  if [[ ${#candidates[@]} -eq 0 ]]; then
+    local hex f
+    for f in /proc/net/tcp /proc/net/tcp6; do
+      [[ -r "$f" ]] || continue
+      while IFS= read -r hex; do
+        [[ -n "$hex" ]] && add_port "$((16#${hex##*:}))"
+      done < <(awk '$4=="0A"{print $2}' "$f" 2>/dev/null || true)
+    done
   fi
   # config 的 server.port 作为兜底候选（可能未监听，但也测一下）
   if [[ -f "$cfg" ]]; then
@@ -109,18 +113,23 @@ detect_3mui_url() {
 
   local base=""
   [[ -n "$webpath" ]] && base="/${webpath}"
-  local p code
+  local p code url
+  # 可达信号：2xx/3xx 都说明端口+协议+路径存活（3m-ui web_path 根路径常返回 301/302 重定向）。
+  # 两轮探测：先把所有端口的 https 测完，再测 http——避免 80 的 http 301（跳 https）抢先命中，
+  # 确保启用了 TLS 的环境优先选中 https（配合 insecure_skip_verify）。
   for p in "${candidates[@]}"; do
-    # 先测 https：3m-ui 启用 TLS 时常只监听 443
-    code=$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 3 "https://127.0.0.1:${p}${base}" 2>/dev/null || echo 000)
-    if [[ "$code" == "200" || "$code" == "302" ]]; then
-      echo "https://127.0.0.1:${p}${base}"
+    url="https://127.0.0.1:${p}${base}"
+    code=$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 3 "$url" 2>/dev/null) || code=000
+    if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then
+      echo "$url"
       return 0
     fi
-    # 再测 http
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${p}${base}" 2>/dev/null || echo 000)
-    if [[ "$code" == "200" || "$code" == "302" ]]; then
-      echo "http://127.0.0.1:${p}${base}"
+  done
+  for p in "${candidates[@]}"; do
+    url="http://127.0.0.1:${p}${base}"
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$url" 2>/dev/null) || code=000
+    if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then
+      echo "$url"
       return 0
     fi
   done

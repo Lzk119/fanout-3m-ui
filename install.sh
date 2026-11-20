@@ -43,6 +43,24 @@ seed_settings() {
   chmod 600 "$f"
 }
 
+# 记录安装前的系统状态，供 f uninstall 精确回滚，做到“卸载=安装前”。
+# 只记录 fanout 自己会改动的项：内核转发值、sysctl.conf 是否已含该行。
+save_prestate() {
+  local f="${WORK_DIR}/.install_prestate"
+  # 重装时不覆盖首次安装留下的快照：卸载才能恢复到“最初安装前”，而不是“上次重装前”。
+  # （卸载会 rm -rf WORK_DIR，prestate 随之消失；下次全新安装时这里会重新记录。）
+  [[ -f "$f" ]] && return
+  printf 'PRE_IPV4_FORWARD=%s\n' "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 1)" > "$f"
+  # 精确匹配 net.ipv4.ip_forward=1：install 只追加这个精确串，卸载的删除正则也只匹配它。
+  # 这样用户原有的 =0、带空格、带注释等行都不会被误删，而 install 追加的行一定能被清掉。
+  if grep -q '^net\.ipv4\.ip_forward=1$' /etc/sysctl.conf 2>/dev/null; then
+    printf 'PRE_SYSCTL_CONF_HAD_IPFORWARD=1\n' >> "$f"
+  else
+    printf 'PRE_SYSCTL_CONF_HAD_IPFORWARD=0\n' >> "$f"
+  fi
+  chmod 600 "$f"
+}
+
 svc_install() {
   if [[ "$INIT_SYS" == systemd ]]; then
     # 端口不写进服务文件：它由 ${WORK_DIR}/settings.json 决定（见 seed_settings），
@@ -202,6 +220,8 @@ else
   echo "      配置项：url、username、password，可选 totp_code、insecure_skip_verify"
 fi
 
+# 改 sysctl/iptables 前先快照原始状态，卸载时据此精确恢复
+save_prestate
 echo "[4/6] 放行转发"
 sysctl -qw net.ipv4.ip_forward=1
 grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null \

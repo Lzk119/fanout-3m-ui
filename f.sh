@@ -308,14 +308,58 @@ do_update() {
   echo -e "  ${G}已更新到 $("$BIN" -version 2>/dev/null)${N}"
 }
 
+# 按安装时记录的原始状态精确回滚系统配置，做到“卸载=安装前”。
+# 没有 prestate 文件（老版本安装）时走保守分支：只清理 fanout 专属痕迹，不猜测用户原值。
+restore_system_state() {
+  local pre="${WORK_DIR}/.install_prestate"
+  local pre_fwd="" had=""
+  if [[ -f "$pre" ]]; then
+    pre_fwd=$(sed -n 's/^PRE_IPV4_FORWARD=//p' "$pre" | head -1)
+    had=$(sed -n 's/^PRE_SYSCTL_CONF_HAD_IPFORWARD=//p' "$pre" | head -1)
+  fi
+
+  # 1) 删除 fanout 注入的 iptables FORWARD 规则（10.99.0.0/16 为 fanout 专用网段，循环删到没有为止）
+  while iptables -C FORWARD -s 10.99.0.0/16 -j ACCEPT 2>/dev/null; do
+    iptables -D FORWARD -s 10.99.0.0/16 -j ACCEPT 2>/dev/null || break
+  done
+  while iptables -C FORWARD -d 10.99.0.0/16 -j ACCEPT 2>/dev/null; do
+    iptables -D FORWARD -d 10.99.0.0/16 -j ACCEPT 2>/dev/null || break
+  done
+  # 同步持久化规则（若系统用 netfilter-persistent）
+  command -v netfilter-persistent >/dev/null && netfilter-persistent save >/dev/null 2>&1 || true
+
+  # 2) 删除 f 菜单“关 IPv6”写入的配置文件，以及 OpenRC 日志
+  rm -f /etc/sysctl.d/99-fanout-ipv6.conf /var/log/fanout.log
+
+  # 3) 仅当安装前 sysctl.conf 没有精确的 net.ipv4.ip_forward=1 行时，才删掉我们追加的那行
+  if [[ "$had" == "0" ]]; then
+    sed -i '/^net\.ipv4\.ip_forward=1$/d' /etc/sysctl.conf 2>/dev/null || true
+  fi
+
+  # 4) 恢复运行时内核转发值到安装前
+  if [[ -n "$pre_fwd" ]]; then
+    sysctl -qw "net.ipv4.ip_forward=${pre_fwd}" 2>/dev/null || true
+  fi
+}
+
 do_uninstall() {
   local yes
   echo
-  read -rp "  确认卸载？隧道和配置都会删除 [y/N]: " yes
+  echo "  将执行以下操作，恢复到安装前状态："
+  echo "    • 停止并禁用 fanout 服务，删除服务文件"
+  echo "    • 删除二进制 /usr/local/bin/fanout 与管理菜单 f"
+  echo "    • 删除数据目录 ${WORK_DIR}（含配置、口令、隧道状态）"
+  echo "    • 清理残留 netns/veth，删除 fanout 注入的 iptables 规则"
+  echo "    • 恢复 net.ipv4.ip_forward 与 /etc/sysctl.conf 到安装前"
+  echo "    • 删除 /etc/sysctl.d/99-fanout-ipv6.conf"
+  echo "    （不会卸载 openvpn/iptables 等依赖包，避免影响系统其它服务）"
+  echo
+  read -rp "  确认卸载？[y/N]: " yes
   [[ ${yes,,} == y ]] || { echo "  已取消"; return; }
 
   svc_stop >/dev/null 2>&1
   svc_disable
+  restore_system_state
   # 清掉残留的 netns 与 veth
   for ns in $(ip netns list 2>/dev/null | awk '{print $1}' | grep '^fo[0-9]'); do
     ip netns del "$ns" 2>/dev/null

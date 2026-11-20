@@ -5,8 +5,8 @@ set -uo pipefail
 WORK_DIR=/var/lib/fanout
 SERVICE=fanout
 BIN=/usr/local/bin/fanout
-# 复刻版必须显式指定发布仓库，避免更新时误装上游原版。
-REPO="${REPO:-}"
+# 默认从本复刻版仓库更新；如需指向其他 fork，可 REPO=xxx 覆盖。
+REPO="${REPO:-Lzk119/fanout-3m-ui}"
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[0;33m'; B='\033[0;36m'; D='\033[2m'; N='\033[0m'
 

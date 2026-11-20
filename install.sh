@@ -242,8 +242,8 @@ if [[ ${#need_cmd[@]} -gt 0 ]]; then
 fi
 
 echo "[2/6] 获取程序"
-# 预编译包必须来自当前复刻版的仓库，不能默认下载上游原版。
-REPO="${REPO:-}"
+# 默认从本复刻版仓库下载预编译包；如需指向其他 fork，可 REPO=xxx 覆盖。
+REPO="${REPO:-Lzk119/fanout-3m-ui}"
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64)  GOARCH=amd64 ;;

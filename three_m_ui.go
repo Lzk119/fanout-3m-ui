@@ -164,18 +164,36 @@ type threeMUIConfig struct {
 // threeMUIConfigPath 是 3m-ui 自身配置文件的固定路径，用于在用户未显式配置 url 时自动探测。
 const threeMUIConfigPath = "/etc/3m-ui/config.yaml"
 
-// probeThreeMUIURL 从 3m-ui 自身的 config.yaml 读取 server.port 与 server.web_path，
-// 拼出本地回环 API 地址（默认 http）。仅当用户未在 panel.yaml/环境变量显式配置 url 时兜底使用。
-// 探测失败（文件不存在、解析失败、缺 port）返回空字符串，交由上层报错提示手动配置。
+// probeThreeMUIURL 在用户未显式配置 url 时自动探测 3m-ui 实际地址：
+// 优先做 live 探测（真实监听端口 + 连通性测试），失败则回退到从 config 拼接 http 地址。
+// 探测失败返回空字符串，交由上层报错提示手动配置。
 func probeThreeMUIURL() string {
+	if u := probeThreeMUIURLLive(); u != "" {
+		return u
+	}
 	return probeThreeMUIURLFromPath(threeMUIConfigPath)
 }
 
-// probeThreeMUIURLFromPath 从指定路径读取 3m-ui config.yaml 并拼接本地地址，拆出参数便于测试。
-func probeThreeMUIURLFromPath(path string) string {
+// probeThreeMUIURLLive 检测 3m-ui 实际监听端口并逐个测连通性，策略与 install.sh 对齐：
+// 候选端口 = 真实监听端口（/proc/net/tcp + tcp6）+ config 的 server.port；先 https 后 http，
+// 取首个 2xx/3xx。https 命中时调用方应同步开启 InsecureSkipVerify。
+func probeThreeMUIURLLive() string {
+	return probeThreeMUIURLLiveFromConfig(threeMUIConfigPath)
+}
+
+// probeThreeMUIURLLiveFromConfig 拆出 config 路径参数，便于单元测试注入临时 config。
+func probeThreeMUIURLLiveFromConfig(path string) string {
+	webPath, cfgPort := readThreeMUIWebPathAndPort(path)
+	ports := appendUniqueInt(listenPortsFn(), cfgPort)
+	return probeReachableURL(ports, webPath)
+}
+
+// readThreeMUIWebPathAndPort 从 3m-ui config.yaml 读出 web_path（已清理首尾斜杠）与 server.port。
+// 解析失败或缺字段时对应返回空串/0，不报错。
+func readThreeMUIWebPathAndPort(path string) (webPath string, port int) {
 	blob, err := os.ReadFile(path)
 	if err != nil {
-		return ""
+		return "", 0
 	}
 	var raw struct {
 		Server struct {
@@ -184,17 +202,119 @@ func probeThreeMUIURLFromPath(path string) string {
 		} `yaml:"server"`
 	}
 	if err := yaml.Unmarshal(blob, &raw); err != nil {
+		return "", 0
+	}
+	return strings.Trim(raw.Server.WebPath, "/"), raw.Server.Port
+}
+
+// probeThreeMUIURLFromPath 从 config 拼出 http 地址（不做连通性测试），作为 live 探测失败后的回退，
+// 也拆出参数便于单元测试 config 解析。
+func probeThreeMUIURLFromPath(path string) string {
+	webPath, port := readThreeMUIWebPathAndPort(path)
+	if port <= 0 {
 		return ""
 	}
-	if raw.Server.Port <= 0 {
-		return ""
-	}
-	// 去掉 web_path 首尾斜杠，避免拼出双斜杠或尾斜杠（newThreeMUI 会统一补 /api/v1）
-	webPath := strings.Trim(raw.Server.WebPath, "/")
+	base := "http://127.0.0.1:" + strconv.Itoa(port)
 	if webPath != "" {
-		return fmt.Sprintf("http://127.0.0.1:%d/%s", raw.Server.Port, webPath)
+		return base + "/" + webPath
 	}
-	return fmt.Sprintf("http://127.0.0.1:%d", raw.Server.Port)
+	return base
+}
+
+// 探测依赖可替换，便于单元测试（默认指向真实实现）。
+var (
+	listenPortsFn   = listenPorts
+	httpProbeStatus = probeHTTPStatus
+)
+
+// listenPorts 读取 /proc/net/tcp 与 /proc/net/tcp6 中所有 LISTEN（状态 0A）端口，去重保序。
+// 非 Linux 或文件不存在时返回空切片（不报错），此时仅靠 config 的 server.port 兜底。
+func listenPorts() []int {
+	return listenPortsFromFiles([]string{"/proc/net/tcp", "/proc/net/tcp6"})
+}
+
+func listenPortsFromFiles(files []string) []int {
+	var ports []int
+	seen := make(map[int]bool)
+	for _, f := range files {
+		blob, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(blob), "\n") {
+			fields := strings.Fields(line)
+			// /proc/net/tcp 第 2 列是 local_address:port，第 4 列是状态，0A = LISTEN
+			if len(fields) < 4 || fields[3] != "0A" {
+				continue
+			}
+			local := fields[1]
+			idx := strings.LastIndex(local, ":")
+			if idx < 0 {
+				continue
+			}
+			port, err := strconv.ParseInt(local[idx+1:], 16, 32)
+			if err != nil || port <= 0 {
+				continue
+			}
+			p := int(port)
+			if !seen[p] {
+				seen[p] = true
+				ports = append(ports, p)
+			}
+		}
+	}
+	return ports
+}
+
+// appendUniqueInt 把补充端口追加到切片（已存在则跳过），保持原顺序。
+func appendUniqueInt(ports []int, extra int) []int {
+	if extra <= 0 {
+		return ports
+	}
+	for _, p := range ports {
+		if p == extra {
+			return ports
+		}
+	}
+	return append(ports, extra)
+}
+
+// probeReachableURL 对候选端口先 https 后 http 逐个测连通性，返回首个 2xx/3xx 的完整 url。
+// 两轮而非逐端口交替，避免 http 301 跳 https 抢先命中，确保启用 TLS 时优先选中 https。
+func probeReachableURL(ports []int, webPath string) string {
+	base := ""
+	if webPath != "" {
+		base = "/" + webPath
+	}
+	for _, scheme := range []string{"https", "http"} {
+		insecure := scheme == "https"
+		for _, p := range ports {
+			u := fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, p, base)
+			code, err := httpProbeStatus(u, insecure)
+			if err == nil && code >= 200 && code < 400 {
+				return u
+			}
+		}
+	}
+	return ""
+}
+
+// probeHTTPStatus 对目标 url 发一次 GET，返回 HTTP 状态码；insecure 为真时跳过 TLS 证书校验
+// （用于本地 3m-ui 自签证书探测）。连接失败返回 error。
+func probeHTTPStatus(rawURL string, insecure bool) (int, error) {
+	client := &http.Client{Timeout: 3 * time.Second}
+	if insecure {
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- 仅本地探测自签证书
+		client.Transport = tr
+	}
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
 }
 
 func loadThreeMUIConfig(workDir string) (threeMUIConfig, error) {
@@ -226,9 +346,14 @@ func loadThreeMUIConfig(workDir string) (threeMUIConfig, error) {
 		}
 		cfg.InsecureSkipVerify = parsed
 	}
-	// 显式配置（panel.yaml / 环境变量）优先；都没给 url 时，从 3m-ui 自身 config.yaml 自动探测端口与 web_path
+	// 显式配置（panel.yaml / 环境变量）优先；都没给 url 时自动探测 3m-ui 实际地址。
+	// 自动探测到本地 https 时，自签证书需跳过校验，否则后续登录会 TLS 握手失败；
+	// 用户显式配置的 url 不强制覆盖其 insecure_skip_verify 设置。
 	if cfg.URL == "" {
 		cfg.URL = probeThreeMUIURL()
+		if strings.HasPrefix(cfg.URL, "https://") {
+			cfg.InsecureSkipVerify = true
+		}
 	}
 	cfg.URL = strings.TrimRight(strings.TrimSpace(cfg.URL), "/")
 	cfg.Username = strings.TrimSpace(cfg.Username)

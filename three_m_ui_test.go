@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -723,5 +724,129 @@ server:
 	// 文件不存在应返回空，而不是 panic
 	if got := probeThreeMUIURLFromPath(filepath.Join(t.TempDir(), "nope.yaml")); got != "" {
 		t.Fatalf("不存在的文件应返回空，got %q", got)
+	}
+}
+
+// portFromURL 从 httptest server URL 中提取端口，供探测测试使用。
+func portFromURL(t *testing.T, raw string) int {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("解析 URL 失败: %v", err)
+	}
+	p, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("提取端口失败: %v", err)
+	}
+	return p
+}
+
+// TestListenPortsFromFiles 验证从 /proc/net/tcp 风格内容解析 LISTEN 端口（hex），非 0A 状态跳过。
+func TestListenPortsFromFiles(t *testing.T) {
+	dir := t.TempDir()
+	tcp := filepath.Join(dir, "tcp")
+	// 模拟 /proc/net/tcp：表头 + 若干行，只有状态 0A 的本地端口被收集
+	content := "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+	content += "   0: 00000000:01BB 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0\n" // 443 LISTEN
+	content += "   1: 0100007F:2382 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12346 1 0000000000000000 100 0 0 10 0\n" // 9090 LISTEN
+	content += "   2: 00000000:0050 00000000:0000 06 00000000:00000000 00:00000000 00000000     0        0 12347 1 0000000000000000 100 0 0 10 0\n" // 80 非 LISTEN，跳过
+	if err := os.WriteFile(tcp, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got := listenPortsFromFiles([]string{tcp, filepath.Join(dir, "missing")})
+	want := []int{443, 9090}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if got := listenPortsFromFiles(nil); len(got) != 0 {
+		t.Fatalf("空列表应返回空, got %v", got)
+	}
+}
+
+// TestProbeReachableURL 验证连通性探测：优先 https、2xx/3xx 算可达、4xx/连接失败不算。
+func TestProbeReachableURL(t *testing.T) {
+	httpsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer httpsSrv.Close()
+	httpsPort := portFromURL(t, httpsSrv.URL)
+
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer httpSrv.Close()
+	httpPort := portFromURL(t, httpSrv.URL)
+
+	// 同时含 https 与 http 端口时，应优先返回 https
+	if got := probeReachableURL([]int{httpsPort, httpPort}, "wp"); got != fmt.Sprintf("https://127.0.0.1:%d/wp", httpsPort) {
+		t.Fatalf("优先 https 失败: got %q", got)
+	}
+	// 仅 http 端口
+	if got := probeReachableURL([]int{httpPort}, "wp"); got != fmt.Sprintf("http://127.0.0.1:%d/wp", httpPort) {
+		t.Fatalf("http 失败: got %q", got)
+	}
+	// https 即使在候选顺序后面也应优先于 http
+	if got := probeReachableURL([]int{httpPort, httpsPort}, "wp"); got != fmt.Sprintf("https://127.0.0.1:%d/wp", httpsPort) {
+		t.Fatalf("https 应优先即使顺序在后: got %q", got)
+	}
+
+	// 3xx 也算可达
+	redirSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/", http.StatusMovedPermanently)
+	}))
+	defer redirSrv.Close()
+	redirPort := portFromURL(t, redirSrv.URL)
+	if got := probeReachableURL([]int{redirPort}, ""); got != fmt.Sprintf("http://127.0.0.1:%d", redirPort) {
+		t.Fatalf("3xx 应算可达: got %q", got)
+	}
+
+	// 4xx 不算可达
+	badSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer badSrv.Close()
+	badPort := portFromURL(t, badSrv.URL)
+	if got := probeReachableURL([]int{badPort}, ""); got != "" {
+		t.Fatalf("4xx 不应算可达: got %q", got)
+	}
+	// 无服务端口应返回空
+	if got := probeReachableURL([]int{1}, ""); got != "" {
+		t.Fatalf("无服务端口应返回空: got %q", got)
+	}
+}
+
+// TestProbeThreeMUIURLLiveFromConfig 验证 live 探测编排：候选端口组装 + 先 https 后 http 的两轮顺序。
+func TestProbeThreeMUIURLLiveFromConfig(t *testing.T) {
+	origListen := listenPortsFn
+	origHTTP := httpProbeStatus
+	defer func() {
+		listenPortsFn = origListen
+		httpProbeStatus = origHTTP
+	}()
+
+	cfg := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfg, []byte("server:\n  port: 8080\n  web_path: /wp\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 监听端口 [80, 443]，config port 8080 追加 → 候选 [80, 443, 8080]
+	listenPortsFn = func() []int { return []int{80, 443} }
+	var calls []string
+	httpProbeStatus = func(u string, insecure bool) (int, error) {
+		calls = append(calls, u)
+		if u == "https://127.0.0.1:443/wp" {
+			return http.StatusMovedPermanently, nil // 301 应算可达
+		}
+		return 0, fmt.Errorf("connection refused")
+	}
+
+	got := probeThreeMUIURLLiveFromConfig(cfg)
+	if got != "https://127.0.0.1:443/wp" {
+		t.Fatalf("got %q, want https://127.0.0.1:443/wp; calls=%v", got, calls)
+	}
+	// 应先测完所有 https 端口再碰 http：80(https) 失败、443(https) 命中即停
+	if len(calls) != 2 || calls[0] != "https://127.0.0.1:80/wp" || calls[1] != "https://127.0.0.1:443/wp" {
+		t.Fatalf("探测顺序不对，应先 https 全量: %v", calls)
 	}
 }

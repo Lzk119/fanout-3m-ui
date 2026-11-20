@@ -9,7 +9,7 @@ fanout 把 VPN Gate 公共节点变成相互隔离的 SOCKS5 出口，再通过 
 ```text
 客户端
   └─ 3m-ui Listener :10001
-       └─ Mihomo 规则 IN-PORT,10001,fanout-jp-home
+       └─ Mihomo 规则 IN-PORT,10001,🇯🇵 日本-fanout-23000
             └─ Mihomo SOCKS5 出站 127.0.0.1:23000
                  └─ fanout SOCKS5
                       └─ network namespace foN
@@ -26,7 +26,7 @@ fanout 把 VPN Gate 公共节点变成相互隔离的 SOCKS5 出口，再通过 
 - 每条出口独立随机 SOCKS5 端口与认证凭据，支持 UDP ASSOCIATE。
 - 使用 3m-ui QuickCreate 创建 VLESS、VMess、Trojan、Shadowsocks、Hysteria2、TUIC v4/v5 Listener。
 - 以现有 Listener 为模板批量复制，保留并合并代理用户绑定。
-- 通过 `IN-PORT,<Listener端口>,fanout-<节点名>` 规则绑定出口。
+- 通过 `IN-PORT,<Listener端口>,<国旗 国家>-fanout-<端口>` 规则绑定出口。
 - 换节点、改端口、重连和服务重启后自动同步绑定与 SOCKS5 出站。
 - 导出普通链接、base64/明文订阅和 Mihomo YAML 订阅。
 - 只清理由 fanout 管理且已不被引用的资源，保留用户在 3m-ui 中的其他配置。
@@ -52,11 +52,16 @@ sudo bash install.sh
 
 ### 使用预编译包
 
-发布到自己的 GitHub 仓库后，将 `<owner>/<repo>` 换成实际仓库：
+默认从本仓库 `Lzk119/fanout-3m-ui` 下载，一条命令即可安装：
 
 ```bash
-export REPO=<owner>/<repo>
-bash <(curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/install.sh")
+bash <(curl -fsSL "https://raw.githubusercontent.com/Lzk119/fanout-3m-ui/main/install.sh")
+```
+
+如需指向其他 fork，用 `REPO` 覆盖：
+
+```bash
+REPO=<owner>/<repo> bash <(curl -fsSL "https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh")
 ```
 
 Alpine 先安装 bash：
@@ -67,7 +72,15 @@ apk add bash curl
 
 ## 配置 3m-ui
 
-创建 `/var/lib/fanout/panel.yaml`：
+安装器会自动完成 3m-ui 配置：
+
+- **自动探测地址**：检测 `3m-ui-bin` 实际监听的端口，逐个测试 http/https 连通性，选出可用地址（不再依赖 `config.yaml` 里可能失效的 `server.port`）。
+- **交互输入凭据**：终端安装时提示输入用户名和密码（密码不回显并二次确认）；非交互安装（`curl|bash`）可通过环境变量传入。
+- **HTTPS 自动处理**：探测到本地 HTTPS 时，自动在配置中写入 `insecure_skip_verify: true`。
+
+生成的配置位于 `/var/lib/fanout/panel.yaml`，凭据留空时安装器会提示补全后重启服务。
+
+如需手动配置，创建 `/var/lib/fanout/panel.yaml`：
 
 ```yaml
 url: "http://127.0.0.1:8080" # 改成 3m-ui 实际地址，不需要手写 /api/v1
@@ -122,7 +135,7 @@ fanout 创建的代理用户带有 `fanout:` 备注。删除 Listener 时，只�
 
 ```yaml
 proxies:
-  - name: fanout-jp-home
+  - name: 🇯🇵 日本-fanout-23000
     type: socks5
     server: 127.0.0.1
     port: 23000
@@ -130,11 +143,11 @@ proxies:
     password: <该出口的SOCKS5密码>
 
 rules:
-  - IN-PORT,10001,fanout-jp-home
+  - IN-PORT,10001,🇯🇵 日本-fanout-23000
   - MATCH,DIRECT
 ```
 
-`IN-PORT` 规则会放在 `MATCH` 前。fanout 只管理 `fanout-` 前缀的出站和对应规则；被代理组、rule-provider、`dialer-proxy` 或其他规则引用的旧出站不会被删除。
+`IN-PORT` 规则会放在 `MATCH` 前。fanout 靠出站名**尾部的 `fanout-<端口>`** 识别自己管理的出站（兼容旧版 `fanout-` 前缀），避免与同样以国旗开头的自建出站冲突；被代理组、rule-provider、`dialer-proxy` 或其他规则引用的出站不会被删除。
 
 ### 订阅
 
@@ -176,8 +189,8 @@ f uninstall  # 卸载
 
 复刻版不会默认从上游仓库更新，避免误装不支持 3m-ui 的原版：
 
-- Web/API 在线更新需要设置 `FANOUT_UPDATE_REPO=<owner>/<repo>`。
-- 命令行更新使用 `REPO=<owner>/<repo> f update`。
+- Web/API 在线更新需要设置 `FANOUT_UPDATE_REPO=<owner>/<repo>`（默认停用，避免误更新）。
+- 命令行 `f update` 默认从 `Lzk119/fanout-3m-ui` 更新；如需指向其他 fork，用 `REPO=<owner>/<repo> f update`。
 
 ## 已知限制
 
